@@ -1,0 +1,15 @@
+# 文件路径: config/default.toml
+
+http_provider_url = "https://api.mainnet-beta.solana.com"
+start_slot = 394645617                                    # 从哪个插槽开始扫描
+
+# 我们要索引的程序列表
+[[programs]]
+idl_path = "idls/my_defi_project.json"
+name = "my_defi_project"
+program_id = "GGBjDqYdicSE6Qmtu6SAsueX1biM5LjbJ8R8vZvFfofA"
+
+[[programs]]
+idl_path = "idls/another_project.json"
+name = "another_project"
+program_id = "Vote111111111111111111111111111111111111111" # 这是一个示例
