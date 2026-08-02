@@ -18,18 +18,27 @@ strip = false
 
 [dependencies]
 anyhow = "1.0.98"
+bigdecimal = { version = "0.4", features = ["serde"] }
+bs58 = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
 config = { version = "0.15.13", features = ["toml"] }
 dotenvy = "0.15.7"
+num-traits = "0.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["default"] }
 solana-client = "2.3.4"
+solana-transaction-status = "2.3.4"
 sqlx = { version = "0.8.6", features = [
   "postgres",
   "runtime-tokio",
   "tls-rustls",
+  "bigdecimal",
+  "chrono",
 ] }
 tokio = { version = "1.46.1", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
+solana-account-decoder-client-types = "2.3.4"
+solana-message = "2.4.0"

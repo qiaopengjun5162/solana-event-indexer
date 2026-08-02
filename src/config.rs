@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 // 这个结构体用来匹配 [[programs]] 这种列表形式的配置
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ProgramConfig {
     pub name: String,
     pub program_id: String,
@@ -15,9 +16,10 @@ pub struct ProgramConfig {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub start_slot: u64,
-    // `programs` 字段是一个包含多个 ProgramConfig 的向量 (Vec)
-    pub programs: Vec<ProgramConfig>,
     pub rpc_url: String,
+    pub database_url: String,
+    #[allow(dead_code)]
+    pub programs: Vec<ProgramConfig>,
 }
 
 impl Config {

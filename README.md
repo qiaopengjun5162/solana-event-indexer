@@ -1,41 +1,87 @@
 # Solana event indexer
 
-## Description
+A Solana block indexer that extracts swap events from on-chain transactions.
 
-This is a simple indexer for Solana events. It listens to Solana events and stores them in a database.
+## Quick start
 
-## Setup
-
-1. Install dependencies:
+### Option 1: Docker Compose (recommended for local testing)
 
 ```bash
-npm install
+cp config/local.toml.example config/local.toml
+# Edit config/local.toml with your RPC endpoint
+
+docker compose up --build
 ```
 
-2. Create a `.env` file with the following content:
+This starts Postgres and the indexer. Migrations run automatically on first boot.
+
+### Option 2: Native
+
+1. Copy the local config template:
 
 ```bash
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_NAME=solana_events
+cp config/local.toml.example config/local.toml
+# Edit config/local.toml with your RPC endpoint and database URL
+```
+
+2. Initialize the database:
+
+```bash
+./scripts/init_db.sh
 ```
 
 3. Run the indexer:
 
 ```bash
-npm run start
+cargo run --release
 ```
 
-## Usage
+## Analyze opportunities
 
-The indexer listens to Solana events and stores them in a database. The database schema is defined in the `schema.sql` file.
+All analysis tools are written in Rust as cargo examples.
+
+List recent swaps:
+
+```bash
+cargo run --example analyze_swaps -- --recent
+```
+
+Analyze a specific pool or token:
+
+```bash
+cargo run --example analyze_swaps -- <pool_id_or_token_mint>
+```
+
+Find cross-pool spreads from the last 5 minutes, requiring at least 0.3% net spread after fees and gas for a $1,000 trade:
+
+```bash
+cargo run --example find_opportunities -- 5 0.3 1000
+```
+
+Arguments:
+- `5`: lookback minutes
+- `0.3`: minimum net spread percentage after fees and gas
+- `1000`: trade size in USD
+
+## Features
+
+- Historic block sync from a configurable start slot, then live mode every 2 seconds.
+- Raydium CPMM swap extraction using instruction discriminator and vault indices.
+- PostgreSQL storage with indexed columns for pool, token pair, and block time.
+- Cross-pool spread analysis with fee and gas cost estimation in Rust.
+
+## Architecture
+
+- `src/parser.rs`: extracts `SwapEvent`s from transaction metadata.
+- `src/db.rs`: inserts swap events into Postgres.
+- `src/main.rs`: loops over slots, fetches blocks, parses swaps, and writes them to the database.
+- `examples/analyze_swaps.rs`: lists recent swaps and price stats.
+- `examples/find_opportunities.rs`: scans recent swaps for cross-pool price discrepancies with cost model.
+
+## Database
+
+Run `migrations/001_swaps.sql` against your Postgres database. The default database name is `solana_events`.
 
 ## License
 
-This project is licensed under the MIT License.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests or open issues.
+MIT

@@ -1,83 +1,124 @@
-// src/main.rs
-
 mod config;
-mod logger; // 引入 logger 模块
+mod db;
+mod logger;
+mod models;
+mod parser;
 
-use crate::config::Config;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
-use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig}; // 引入 RpcClient
+use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig};
+use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatusMeta};
 use tracing::info;
+
+use crate::{config::Config, models::SwapEvent};
+
+fn process_transaction(
+    tx_with_meta: EncodedTransactionWithStatusMeta,
+    slot: u64,
+    block_time: Option<DateTime<Utc>>,
+) -> Vec<SwapEvent> {
+    let signature = match &tx_with_meta.transaction {
+        EncodedTransaction::Json(tx) => tx.signatures.first().cloned().unwrap_or_default(),
+        _ => return Vec::new(),
+    };
+
+    let Some(meta) = tx_with_meta.meta else {
+        return Vec::new();
+    };
+
+    parser::extract_swaps(
+        &signature,
+        slot,
+        block_time,
+        &meta,
+        &tx_with_meta.transaction,
+    )
+}
+
+async fn process_slot(
+    client: &RpcClient,
+    pool: &sqlx::PgPool,
+    slot: u64,
+    config: &RpcBlockConfig,
+) -> anyhow::Result<()> {
+    let block = client.get_block_with_config(slot, *config)?;
+    let block_time = block.block_time.and_then(DateTime::from_timestamp_secs);
+
+    if let Some(txs) = block.transactions {
+        for tx_with_meta in txs {
+            for swap in process_transaction(tx_with_meta, slot, block_time) {
+                if let Err(e) = db::insert_swap(pool, &swap).await {
+                    tracing::error!("Failed to insert swap: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
-
-    // 1. 初始化日志
     logger::init_logger();
 
-    // 2. 加载配置
     info!("Loading configuration...");
     let config = Config::load()?;
-    info!("✅ Configuration loaded successfully!");
-    // 我们可以保留这行来调试，也可以暂时注释掉
-    // info!("{:#?}", config);
+    info!("Configuration loaded");
 
-    // 3. 🚀 使用配置信息来连接 Solana RPC
+    let pool = db::init_pool(&config.database_url).await?;
+    info!("Database pool initialized");
+
     let client = RpcClient::new(config.rpc_url);
     info!("Connecting to Solana RPC at: {}", client.url());
 
-    // 4. 获取链上的最新 slot
     let latest_slot = client.get_slot()?;
     info!("Chain tip is at slot: {}", latest_slot);
 
-    // 5. 确定我们的同步范围
+    let rpc_block_config = RpcBlockConfig {
+        max_supported_transaction_version: Some(0),
+        ..Default::default()
+    };
+
     let mut current_slot = config.start_slot;
-    info!(
-        "Starting historic sync from slot {} up to {}",
-        current_slot, latest_slot
-    );
+    if current_slot <= latest_slot {
+        info!(
+            "Starting historic sync from slot {} up to {}",
+            current_slot, latest_slot
+        );
+        while current_slot <= latest_slot {
+            if let Err(e) = process_slot(&client, &pool, current_slot, &rpc_block_config).await {
+                tracing::warn!("Could not fetch block {}: {}", current_slot, e);
+            }
+            current_slot += 1;
+        }
+        info!("Historic sync finished");
+    }
 
-    // 3. 循环获取并处理每一个区块
-    while current_slot <= latest_slot {
-        info!("Fetching block for slot: {}", current_slot);
+    info!("Switching to live mode");
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let mut last_processed = latest_slot;
 
-        let rpc_block_config = RpcBlockConfig {
-            max_supported_transaction_version: Some(0),
-            ..Default::default()
-        };
+    loop {
+        interval.tick().await;
 
-        // 使用 match 来优雅地处理可能跳过的空 slot
-        match client.get_block_with_config(current_slot, rpc_block_config) {
-            Ok(block) => {
-                info!(
-                    "✅ Processed block {}: blockhash={}",
-                    current_slot, block.blockhash
-                );
-                // 这里就是未来调用 parser 和 db 的地方
+        match client.get_slot() {
+            Ok(latest) => {
+                if latest > last_processed {
+                    for slot in (last_processed + 1)..=latest {
+                        if let Err(e) = process_slot(&client, &pool, slot, &rpc_block_config).await
+                        {
+                            tracing::warn!("Could not fetch block {}: {}", slot, e);
+                        }
+                    }
+                    last_processed = latest;
+                }
             }
             Err(e) => {
-                // 如果一个 slot 不存在（被跳过），RPC 会返回错误，我们可以简单地记录并继续
-                // 注意：这里需要更精细的错误处理，判断是真的网络错误还是只是 slot 被跳过
-                tracing::warn!(
-                    "Could not fetch block {}: {}. It might be a skipped slot.",
-                    current_slot,
-                    e
-                );
+                tracing::warn!("Failed to get latest slot: {}", e);
             }
         }
-
-        current_slot += 1;
     }
-
-    info!("🎉 Historic sync finished!");
-
-    // 5. 🚀 遍历我们想要索引的程序
-    //    这段代码读取了 config.programs，又消除了一个警告！
-    info!("Will be indexing the following programs:");
-    for program in &config.programs {
-        info!("-> Name: {}, ID: {}", program.name, program.program_id);
-        info!("-> IDL path: {}", program.idl_path);
-    }
-
-    Ok(())
 }

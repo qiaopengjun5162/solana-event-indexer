@@ -72,6 +72,20 @@ feature-depth = 1
 ignore = [
   "RUSTSEC-2022-0093", # 忽略 ed25519-dalek 的漏洞
   "RUSTSEC-2024-0344",
+  "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained; pulled in via solana-transaction-status
+  "RUSTSEC-2026-0007", # bytes: integer overflow in reserve; transitive via solana-sdk
+  "RUSTSEC-2026-0204", # crossbeam-epoch: invalid pointer dereference; transitive via solana-sdk
+  "RUSTSEC-2025-0161", # libsecp256k1: unmaintained; transitive via solana-secp256k1-recover
+  "RUSTSEC-2025-0119", # number_prefix: unmaintained; transitive via solana-tpu-client
+  "RUSTSEC-2026-0037", # quinn-proto: DoS in QUIC endpoints; transitive via solana-client
+  "RUSTSEC-2025-0047", # slab: get_disjoint_mut UB; transitive via solana-client
+  "RUSTSEC-2026-0009", # time: stack exhaustion via RFC 2822; transitive via x509-parser
+  "RUSTSEC-2025-0055", # tracing-subscriber: ANSI escape injection; transitive via solana-logger
+  "RUSTSEC-2026-0185", # quinn-proto: remote memory exhaustion; transitive via solana-client
+  "RUSTSEC-2026-0098", # rustls-webpki: name constraints; transitive via reqwest/rustls
+  "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints; transitive via reqwest/rustls
+  "RUSTSEC-2026-0104", # x509-parser: CRL parsing panic; transitive via solana-client
+  "RUSTSEC-2026-0049", # x509-parser: CRL matching logic; transitive via solana-client
   #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
   #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
   #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
@@ -97,6 +111,7 @@ allow = [
   "MPL-2.0",
   "CDLA-Permissive-2.0",
   "BSD-3-Clause",
+  "BSD-2-Clause",
   "Zlib",
 ]
 # The confidence threshold for detecting a license from license text.

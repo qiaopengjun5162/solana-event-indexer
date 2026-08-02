@@ -1,0 +1,6 @@
+target
+.git
+.env
+config/local.toml
+scripts/__pycache__
+*.md
