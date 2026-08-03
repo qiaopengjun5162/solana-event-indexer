@@ -21,7 +21,7 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 | Swap listing example (`examples/analyze_swaps.rs`) | Done | Yes (cargo check + clippy) |
 | Opportunity finder example (`examples/find_opportunities.rs`) | Done | Yes (cargo check + clippy) |
 | `cargo deny` license/advisory check | Done | Yes |
-| Real data ingestion | Blocked | Needs valid mainnet RPC URL |
+| Real data ingestion | Blocked | Devnet flow verified; needs paid mainnet RPC for Raydium swaps |
 | Real spread detection | Not yet | - |
 
 ## Verification commands run
@@ -35,6 +35,7 @@ cargo deny check
 docker compose up -d postgres
 ./scripts/init_db.sh
 # cargo run --release blocked by expired RPC URLs in .env
+./target/release/solana-event-indexer --rpc-url YOUR_DEVNET_RPC_URL --single-slot 480833640  # devnet flow verified
 ```
 
 All checks pass; the release binary builds. Real ingestion is blocked by RPC credentials.

@@ -48,6 +48,15 @@ cargo run --release -- --rpc-url https://mainnet.helius-rpc.com/?api-key=YOUR_AP
 # Override start slot for historic sync
 cargo run --release -- --start-slot 320000000
 ```
+You can use a devnet RPC URL from another local project to verify the full pipeline end-to-end (configuration → DB → RPC → block fetch → parse → insert). Devnet has no Raydium CPMM swaps, so the `swaps` table will remain empty.
+
+```bash
+./target/release/solana-event-indexer \
+  --rpc-url YOUR_DEVNET_RPC_URL \
+  --single-slot 480833640
+```
+
+For real Raydium CPMM arbitrage signals you need a paid mainnet RPC endpoint (Helius, QuickNode, Alchemy, etc.). Public mainnet endpoints (`https://api.mainnet-beta.solana.com`) usually time out under block-by-block load.
 
 CLI arguments are also read from environment variables: `SOLANA_RPC_URL` and `SOLANA_START_SLOT`.
 
