@@ -16,7 +16,7 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 | Swap event model (`src/models.rs`) | Done | Yes (cargo check) |
 | DB insertion (`src/db.rs`) | Done | Yes (cargo check) |
 | Raydium CPMM parser (`src/parser.rs`) | Done | Yes (cargo check + clippy + unit tests) |
-| Historic + live sync (`src/main.rs`) | Done | Yes (cargo check + clippy) |
+| Historic + live sync (`src/main.rs`) | Done | Yes (cargo check + clippy + CLI args) |
 | Docker compose setup | Done | Yes (postgres up) |
 | Swap listing example (`examples/analyze_swaps.rs`) | Done | Yes (cargo check + clippy) |
 | Opportunity finder example (`examples/find_opportunities.rs`) | Done | Yes (cargo check + clippy) |
@@ -46,4 +46,4 @@ All checks pass; the release binary builds. Real ingestion is blocked by RPC cre
 - The heuristic fallback can misclassify non-Raydium DEX swaps as Raydium swaps.
 - Gas cost model in `find_opportunities` uses hardcoded estimates (50k base + 3x priority fee lamports, $150 SOL price, 0.25% per side fee). These should be calibrated against real transactions.
 - `deny.toml` now ignores several Solana SDK transitive advisories. These should be reviewed and removed as upstream crates release patched versions.
-- All RPC URLs found in `.env` and Solana CLI config are either expired (401) or public endpoints that time out. Provide a Helius/QuickNode/Alchemy mainnet RPC URL to continue real data ingestion.
+- All RPC URLs found in `.env` and Solana CLI config are either expired (401) or public endpoints that time out. Use `--rpc-url` to pass a Helius/QuickNode/Alchemy mainnet RPC URL directly.

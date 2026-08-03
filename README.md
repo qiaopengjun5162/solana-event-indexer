@@ -37,6 +37,19 @@ cargo run --release
 ```
 
 ## Analyze opportunities
+### CLI overrides
+
+You can override the RPC URL and start slot from the command line without editing `.env` or config files:
+
+```bash
+# Single-slot test mode (useful for verifying the parser without a long sync)
+cargo run --release -- --rpc-url https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY --single-slot 320000000
+
+# Override start slot for historic sync
+cargo run --release -- --start-slot 320000000
+```
+
+CLI arguments are also read from environment variables: `SOLANA_RPC_URL` and `SOLANA_START_SLOT`.
 
 All analysis tools are written in Rust as cargo examples.
 
