@@ -1,7 +1,8 @@
 # 文件路径: config/default.toml
 
-http_provider_url = "https://api.mainnet-beta.solana.com"
-start_slot = 394645617                                    # 从哪个插槽开始扫描
+database_url = "postgres://postgres:postgres@localhost:5432/solana_events"
+rpc_url = "https://api.mainnet-beta.solana.com"
+start_slot = 394645617
 
 # 我们要索引的程序列表
 [[programs]]
