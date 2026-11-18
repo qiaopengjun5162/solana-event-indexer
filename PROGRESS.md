@@ -78,7 +78,7 @@ not real depth.
 cargo fmt
 cargo check --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets                       # 12 lib tests + 1 integration test
+cargo test --all-targets                       # 13 lib tests + 1 integration test
 psql -f migrations/002_dedupe_swaps.sql
 cargo run -- --backfill 60 --rpc-url https://api.mainnet-beta.solana.com
 cargo run -- --spread-report --window-slots 5000 --min-net-pct 0.05
