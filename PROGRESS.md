@@ -23,6 +23,7 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 | Spread report CLI (`--spread-report`) | Done | Yes (real-data run) |
 | `PoolState` + reserve mid price (`src/pool_state.rs`) | Done | **Yes — 67/69 pools resolved on mainnet** |
 | Reserves report CLI (`--reserves-report`) | Done | Yes (live vault balances + VWAP deviation) |
+| Size-aware arbitrage sizing (`src/arb.rs`) | Done | Yes (7 unit tests + live run: optimal 0.0093 units) |
 | `cargo deny` license/advisory check | Done | Yes |
 
 ## What changed in this pass
@@ -31,7 +32,7 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 
 `RAYDIUM_CPMM_PROGRAM_ID` used to be `CPMMoo8L3F4NbTegBCKVNunggLgHpjANv64BHgf7Ct91`.
 The on-chain program is `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`
-(first 24 chars identical, the rest unrelated). `getAccountInfo` on the old
+(first 26 chars identical, the rest unrelated). `getAccountInfo` on the old
 address returns `null`, and `getSignaturesForAddress` returns `[]` instead of an
 error — so it looked like "there is no data", when in fact we were asking about
 an address that does not exist.
@@ -140,13 +141,37 @@ Two guards are load-bearing, both learned the hard way:
 the instantaneous cross-pool spread per pair with its depth, and how far the
 trade VWAP sits from the reserve price.
 
+### 7. Sizing, because a spread percentage is not a trade
+
+`src/arb.rs` answers the question the percentage cannot: *how much can I put in*.
+Two constant-product pools, 25 bps per side, and a ternary search over the
+profit curve — the curve is single-peaked because a larger order eats its own
+spread. Output per comparable pair:
+
+```
+低 nNJnkTHy @ 1.0277（深度 2.8470）
+高 4nKqpCq6 @ 1.0537（深度 1.3961）
+最优下单：投入 0.009315 → 拿回 0.009409，毛利 9.3819e-5（+101 bps），吃掉低价池 0.33% 的储备
+```
+
+That is the whole point in one line: the 2.036% net spread is real, and the
+*optimal* trade is 0.009 quote units for a profit of 0.00009. Both pools hold
+single-digit units, so no real order survives. The model deliberately stops at
+two pools, one hop, and zero gas — it is an upper bound, and it says so in the
+code.
+
+Tests cover the invariants that caught a wrong assumption during development:
+a round trip in one pool must lose (fees, then price impact); identical pools
+must yield `None`; a 0.2% spread must die on 50 bps of fees; a larger
+mispricing must yield more profit; and the optimum must respect pool capacity.
+
 ## Verification commands run
 
 ```bash
 cargo fmt
 cargo check --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets                       # 25 lib tests + 1 integration test
+cargo test --all-targets                       # 32 lib tests + 1 integration test
 psql -f migrations/002_dedupe_swaps.sql
 psql -f migrations/003_pool_id_is_pool_state.sql   # 清空旧行：pool_id 语义变了
 cargo run --release -- --backfill 700 --rpc-url https://api.mainnet-beta.solana.com
@@ -192,9 +217,12 @@ column is the measurement of that.
 - **VWAP is a lagging estimate.** Measured against live reserves it deviates by
   tens of percent on thin pools (see above). Treat `--spread-report` as a
   trade-history summary, not a quote; use `--reserves-report` for a price.
-- **Depth is a reserve balance, not executable size.** No slippage model yet:
-  a 2% spread between a 3-unit pool and a 1.4-unit pool cannot absorb a trade.
-  Next step: constant-product output computation for a given notional.
+- **Depth is a reserve balance, not executable size.** `src/arb.rs` now computes
+  the optimal trade for a pair with constant-product fill, but it assumes the
+  reserves stay put and that the only cost is the 25 bps fee. Gas, priority
+  fees, multi-hop routes and being front-run are all missing — the number it
+  prints is an upper bound, and on single-digit-unit pools it is a very small
+  one.
 - **The heuristic fallback still writes rows.** A transaction with no CPMM swap
   instruction (or one whose instruction we fail to decode) falls back to
   "any two token deltas under one owner", and `pool_id` becomes that owner.

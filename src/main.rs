@@ -11,7 +11,7 @@ use tracing::info;
 
 use solana_event_indexer::parser::RAYDIUM_CPMM_PROGRAM_ID;
 use solana_event_indexer::pool_state::{self, ReserveQuote};
-use solana_event_indexer::{backfill, config::Config, db, logger, parser, spread};
+use solana_event_indexer::{arb, backfill, config::Config, db, logger, parser, spread};
 
 #[derive(Parser)]
 #[command(name = "solana-event-indexer")]
@@ -279,6 +279,25 @@ async fn report_reserves(
             fmt_price(dear.price),
             fmt_price(dear.depth_quote())
         );
+        match arb::best_two_pool_arb(cheap, dear) {
+            Some(result) => {
+                println!(
+                    "      最优下单：投入 {} → 拿回 {}，毛利 {}（{:+.0} bps），吃掉低价池 {:.2}% 的储备",
+                    fmt_price(result.amount_in),
+                    fmt_price(result.amount_out),
+                    fmt_price(result.profit),
+                    result.profit_bps,
+                    result.pool_impact * 100.0
+                );
+                if result.pool_impact > 0.05 {
+                    println!(
+                        "      ⚠ 这个规模要吃掉低价池 5% 以上的储备：恒定乘积假设下成立，\
+                        真实成交会因为滑点与抢跑而缩水"
+                    );
+                }
+            }
+            None => println!("      两池价差不足以覆盖双边手续费，没有可执行空间"),
+        }
     }
     if comparable.is_empty() {
         println!("  没有交易对拥有两个以上池子，跨池价差无从检验。");
