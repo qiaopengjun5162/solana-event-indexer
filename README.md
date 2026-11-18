@@ -114,6 +114,32 @@ more than `--max-slot-gap` apart are skipped as stale; then 25 bps × 2 sides of
 CPMM fee and one transaction's gas are subtracted. `--min-swaps-per-pool`
 (default 3) keeps thin pools out of the comparison.
 
+### Reading the real price from pool reserves
+
+Trade-derived VWAP is a lagging estimate: it describes fills that already
+happened. A pool's executable quote is the ratio of its two vault balances, and
+that is three account reads away —
+
+`PoolState` (637 bytes, Anchor discriminator `f7ede3f5d7c3de46`) →
+`token_0_vault` / `token_1_vault` → each vault's `amount`.
+
+```bash
+cargo run --release -- --reserves-report \
+  --rpc-url https://api.mainnet-beta.solana.com --pool-limit 200
+```
+
+The report answers three questions in order:
+
+1. How many stored `pool_id`s actually resolve to a CPMM `PoolState` on chain;
+2. For every pair with ≥ 2 pools, the instantaneous cross-pool spread (gross and
+   after 50 bps of fees);
+3. How far the trade VWAP sits from the reserve price, per pool.
+
+Two guards are load-bearing. A length check alone is not enough — an Orca
+Whirlpool account is 653 bytes, passes a `>= 637` test, and would silently
+"parse" into garbage addresses — so both the discriminator and the account owner
+program are verified before any field is read.
+
 ## Features
 
 - Historic block sync from a configurable start slot, then live mode every 2 seconds.
@@ -129,8 +155,9 @@ CPMM fee and one transaction's gas are subtracted. `--min-swaps-per-pool`
 - `src/parser.rs`: extracts `SwapEvent`s from transaction metadata.
 - `src/backfill.rs`: `getSignaturesForAddress` + `getTransaction` ingestion; verifies the program account first.
 - `src/spread.rs`: direction-normalised VWAP quotes and the opportunity model (fees, gas, slot proximity).
+- `src/pool_state.rs`: CPMM `PoolState` + token-account decoding, reserve-based mid price, batched `getMultipleAccounts` reads.
 - `src/db.rs`: inserts swap events (dedupe via unique index) and reads the analysis window.
-- `src/main.rs`: CLI — block sync by default, plus `--backfill` and `--spread-report` modes.
+- `src/main.rs`: CLI — block sync by default, plus `--backfill`, `--spread-report` and `--reserves-report` modes.
 - `examples/analyze_swaps.rs`: lists recent swaps and price stats.
 - `examples/find_opportunities.rs`: thin CLI over `src/spread.rs`.
 

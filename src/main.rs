@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatus
 use tracing::info;
 
 use solana_event_indexer::parser::RAYDIUM_CPMM_PROGRAM_ID;
+use solana_event_indexer::pool_state::{self, ReserveQuote};
 use solana_event_indexer::{backfill, config::Config, db, logger, parser, spread};
 
 #[derive(Parser)]
@@ -57,6 +59,14 @@ struct Args {
     /// Minimum swaps per pool before it can be compared.
     #[arg(long, default_value_t = 3)]
     min_swaps_per_pool: usize,
+
+    /// Print an on-chain reserves report (instantaneous mid prices read from
+    /// the two vault balances of each pool) and exit.
+    #[arg(long)]
+    reserves_report: bool,
+    /// How many of the most active pools to load reserves for.
+    #[arg(long, default_value_t = 200)]
+    pool_limit: i64,
 }
 
 fn process_transaction(
@@ -153,6 +163,172 @@ async fn report_spread(pool: &sqlx::PgPool, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn short_key(key: &str) -> String {
+    key.chars().take(8).collect()
+}
+
+/// 价格量级差得太多（1e-7 和 2000 都可能出现），统一成能看出区别的格式。
+fn fmt_price(price: f64) -> String {
+    if price >= 1.0 {
+        format!("{price:.4}")
+    } else if price >= 0.001 {
+        format!("{price:.6}")
+    } else {
+        format!("{price:.4e}")
+    }
+}
+
+/// 链上储备报告：中间价来自两个金库的当前余额，而不是历史成交。
+///
+/// 这份报告要回答三件事：
+/// 1. 库里的 pool_id 到底能不能解析成 PoolState（旧数据里存的是金库 owner PDA）
+/// 2. 同一个交易对的多个池子，此刻的瞬时价差是多少
+/// 3. 用成交算出来的 VWAP 偏离真实中间价多少——这决定了 VWAP 能不能当报价用
+async fn report_reserves(
+    client: &solana_client::nonblocking::rpc_client::RpcClient,
+    pool: &sqlx::PgPool,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let (swaps, pools, max_slot) = db::stats(pool).await?;
+    if pools == 0 {
+        println!("数据库里还没有 swap，先跑 `--backfill 200` 灌一批真实数据。");
+        return Ok(());
+    }
+
+    let pool_ids = db::top_pools(pool, args.pool_limit).await?;
+    println!(
+        "库内 {} 笔 swap / {} 个 pool_id / 最高 slot {}",
+        swaps, pools, max_slot
+    );
+    println!("读取前 {} 个最活跃池子的储备...", pool_ids.len());
+
+    let snapshot = pool_state::fetch_reserves(client, &pool_ids).await?;
+    println!(
+        "解析成功 {} 个池子，账户缺失 {} 个，解析失败 {} 个，金库读不到 {} 个（查询 slot {}）",
+        snapshot.quotes.len(),
+        snapshot.missing.len(),
+        snapshot.unparsable.len(),
+        snapshot.missing_vaults,
+        snapshot.slot
+    );
+    if !snapshot.missing.is_empty() {
+        println!(
+            "  ⚠ 账户缺失意味着这些 pool_id 在链上不是账户（旧版本写入的是金库 owner PDA），示例：{}",
+            snapshot
+                .missing
+                .iter()
+                .take(3)
+                .map(|id| short_key(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !snapshot.unparsable.is_empty() {
+        println!("  ⚠ 解析失败示例：{}", snapshot.unparsable[0]);
+    }
+    println!();
+
+    if snapshot.quotes.is_empty() {
+        println!("没有读到任何储备，价差无从谈起。");
+        return Ok(());
+    }
+
+    // 同一个交易对聚到一起：只有 ≥2 个池子才存在「跨池」这回事
+    let mut by_pair: HashMap<(String, String), Vec<&ReserveQuote>> = HashMap::new();
+    for quote in &snapshot.quotes {
+        by_pair
+            .entry((quote.base_mint.clone(), quote.quote_mint.clone()))
+            .or_default()
+            .push(quote);
+    }
+
+    let fee_pct = spread::RAYDIUM_CPMM_FEE_BPS * 2.0 / 100.0;
+    let mut comparable: Vec<_> = by_pair.iter().filter(|(_, q)| q.len() >= 2).collect();
+    comparable.sort_by_key(|(_, quotes)| std::cmp::Reverse(quotes.len()));
+
+    println!(
+        "交易对 {} 个，其中 ≥2 个池子可比 {} 个",
+        by_pair.len(),
+        comparable.len()
+    );
+    for ((base, quote_mint), quotes) in comparable.iter().take(10) {
+        let mut sorted: Vec<&ReserveQuote> = (*quotes).clone();
+        sorted.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+        let cheap = sorted.first().unwrap();
+        let dear = sorted.last().unwrap();
+        let gross = (dear.price - cheap.price) / cheap.price * 100.0;
+        let net = gross - fee_pct;
+        println!(
+            "  {} / {}  {} 池  毛 {:.3}%  扣双边费 {:.3}% → 净 {:.3}%",
+            short_key(base),
+            short_key(quote_mint),
+            quotes.len(),
+            gross,
+            fee_pct,
+            net
+        );
+        println!(
+            "      低 {} @ {}（深度 {}）",
+            short_key(&cheap.pool_id),
+            fmt_price(cheap.price),
+            fmt_price(cheap.depth_quote())
+        );
+        println!(
+            "      高 {} @ {}（深度 {}）",
+            short_key(&dear.pool_id),
+            fmt_price(dear.price),
+            fmt_price(dear.depth_quote())
+        );
+    }
+    if comparable.is_empty() {
+        println!("  没有交易对拥有两个以上池子，跨池价差无从检验。");
+    }
+    println!();
+
+    // 储备中间价 vs 成交 VWAP：同一个池子、同一段窗口
+    let raw = db::fetch_recent_swaps(pool, args.window_slots).await?;
+    let vwaps = spread::build_quotes(&raw);
+    let mut by_pool: HashMap<&str, f64> = HashMap::new();
+    for list in vwaps.values() {
+        for q in list {
+            by_pool.insert(q.pool_id.as_str(), q.vwap);
+        }
+    }
+
+    let mut deviations: Vec<(&ReserveQuote, f64, f64)> = Vec::new();
+    for quote in &snapshot.quotes {
+        if let Some(vwap) = by_pool.get(quote.pool_id.as_str())
+            && *vwap > 0.0
+        {
+            let dev_pct = (quote.price - vwap) / vwap * 100.0;
+            deviations.push((quote, *vwap, dev_pct));
+        }
+    }
+    deviations
+        .sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!(
+        "储备价 vs 成交 VWAP（窗口 {} slots，可比 {} 个池子）：",
+        args.window_slots,
+        deviations.len()
+    );
+    if deviations.is_empty() {
+        println!("  库里没有与储备池子匹配的成交，先回填一段数据。");
+    }
+    for (quote, vwap, dev_pct) in deviations.iter().take(8) {
+        println!(
+            "  {}  {}  储备 {}  VWAP {}  偏离 {:+.2}%",
+            short_key(&quote.pool_id),
+            short_key(&quote.base_mint),
+            fmt_price(quote.price),
+            fmt_price(*vwap),
+            dev_pct
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -177,6 +353,11 @@ async fn main() -> anyhow::Result<()> {
 
     if args.spread_report {
         return report_spread(&pool, &args).await;
+    }
+
+    if args.reserves_report {
+        let client = solana_client::nonblocking::rpc_client::RpcClient::new(config.rpc_url.clone());
+        return report_reserves(&client, &pool, &args).await;
     }
 
     if let Some(max_txs) = args.backfill {

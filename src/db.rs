@@ -85,3 +85,17 @@ pub async fn stats(pool: &PgPool) -> anyhow::Result<(i64, i64, i64)> {
     .await?;
     Ok((row.get("swaps"), row.get("pools"), row.get("max_slot")))
 }
+
+/// 成交最多的池子地址，按成交笔数倒序。
+///
+/// 读储备是「一个池子三次账户查询」，不可能把全链几万个池子都拉一遍，
+/// 所以按库里的活跃度取前 N 个。
+pub async fn top_pools(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT pool_id FROM swaps GROUP BY pool_id ORDER BY COUNT(*) DESC, pool_id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.get("pool_id")).collect())
+}

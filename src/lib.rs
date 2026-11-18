@@ -9,4 +9,5 @@ pub mod db;
 pub mod logger;
 pub mod models;
 pub mod parser;
+pub mod pool_state;
 pub mod spread;
