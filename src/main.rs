@@ -1,19 +1,15 @@
-mod config;
-mod db;
-mod logger;
-mod models;
-mod parser;
-
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use dotenvy::dotenv;
-use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig};
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcBlockConfig;
 use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatusMeta};
 use tracing::info;
 
-use crate::{config::Config, models::SwapEvent};
+use solana_event_indexer::parser::RAYDIUM_CPMM_PROGRAM_ID;
+use solana_event_indexer::{backfill, config::Config, db, logger, parser, spread};
 
 #[derive(Parser)]
 #[command(name = "solana-event-indexer")]
@@ -28,13 +24,46 @@ struct Args {
     /// Only fetch a single slot and exit (useful for testing the parser).
     #[arg(long)]
     single_slot: Option<u64>,
+
+    /// Backfill recent transactions of the CPMM program via
+    /// getSignaturesForAddress + getTransaction, then exit. Value = max txs.
+    #[arg(long)]
+    backfill: Option<usize>,
+    /// Stop backfilling once this many new swaps are stored.
+    #[arg(long, default_value_t = 200)]
+    min_swaps: usize,
+    /// Program to backfill from.
+    #[arg(long, default_value_t = RAYDIUM_CPMM_PROGRAM_ID.to_string())]
+    program_id: String,
+
+    /// Print cross-pool spread report from stored swaps and exit.
+    #[arg(long)]
+    spread_report: bool,
+    /// Slot window used by the spread report.
+    #[arg(long, default_value_t = 600)]
+    window_slots: i64,
+    /// Minimum net spread (percent) to report.
+    #[arg(long, default_value_t = 0.3)]
+    min_net_pct: f64,
+    /// Notional used to convert spread into profit.
+    #[arg(long, default_value_t = 1000.0)]
+    trade_size_usd: f64,
+    /// SOL price used for the gas cost model.
+    #[arg(long, default_value_t = 150.0)]
+    sol_price_usd: f64,
+    /// Max slot difference between the two pool quotes.
+    #[arg(long, default_value_t = 20)]
+    max_slot_gap: i64,
+    /// Minimum swaps per pool before it can be compared.
+    #[arg(long, default_value_t = 3)]
+    min_swaps_per_pool: usize,
 }
 
 fn process_transaction(
     tx_with_meta: EncodedTransactionWithStatusMeta,
     slot: u64,
     block_time: Option<DateTime<Utc>>,
-) -> Vec<SwapEvent> {
+) -> Vec<solana_event_indexer::models::SwapEvent> {
     let signature = match &tx_with_meta.transaction {
         EncodedTransaction::Json(tx) => tx.signatures.first().cloned().unwrap_or_default(),
         _ => return Vec::new(),
@@ -75,6 +104,55 @@ async fn process_slot(
     Ok(())
 }
 
+async fn report_spread(pool: &sqlx::PgPool, args: &Args) -> anyhow::Result<()> {
+    let (swaps, pools, max_slot) = db::stats(pool).await?;
+    if swaps == 0 {
+        println!("数据库里还没有 swap，先跑 `--backfill 200` 灌一批真实数据。");
+        return Ok(());
+    }
+
+    let raw = db::fetch_recent_swaps(pool, args.window_slots).await?;
+    let quotes = spread::build_quotes(&raw);
+    let params = spread::Params {
+        sol_price_usd: args.sol_price_usd,
+        max_slot_gap: args.max_slot_gap,
+        min_net_pct: args.min_net_pct,
+        trade_size_usd: args.trade_size_usd,
+        min_swaps_per_pool: args.min_swaps_per_pool,
+        ..Default::default()
+    };
+    let opportunities = spread::find_opportunities(&quotes, &params);
+
+    println!(
+        "库内 {} 笔 swap / {} 个池子 / 最高 slot {}",
+        swaps, pools, max_slot
+    );
+    println!(
+        "窗口 {} slots 内 {} 笔成交，覆盖 {} 个交易对",
+        args.window_slots,
+        raw.len(),
+        quotes.len()
+    );
+    println!(
+        "门槛：净价差 ≥ {}%，双边手续费 {} bps，交易额 ${}，slot 差 ≤ {}",
+        args.min_net_pct,
+        spread::RAYDIUM_CPMM_FEE_BPS as i64,
+        args.trade_size_usd,
+        args.max_slot_gap
+    );
+    println!();
+
+    if opportunities.is_empty() {
+        println!("没有超过门槛的跨池价差。");
+        return Ok(());
+    }
+    for o in &opportunities {
+        println!("{}", o.render());
+    }
+    println!("\n合计 {} 个机会", opportunities.len());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -84,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Loading configuration...");
     let mut config = Config::load()?;
-    if let Some(rpc_url) = args.rpc_url {
+    if let Some(rpc_url) = args.rpc_url.clone() {
         config.rpc_url = rpc_url;
     }
     if let Some(start_slot) = args.start_slot {
@@ -93,11 +171,37 @@ async fn main() -> anyhow::Result<()> {
     info!("Configuration loaded");
 
     info!("Database URL: {}", config.database_url);
-    info!("Start slot: {}", config.start_slot);
-    info!("RPC URL: {}", config.rpc_url);
 
     let pool = db::init_pool(&config.database_url).await?;
     info!("Database pool initialized");
+
+    if args.spread_report {
+        return report_spread(&pool, &args).await;
+    }
+
+    if let Some(max_txs) = args.backfill {
+        info!(
+            "Backfilling up to {} transactions from {}",
+            max_txs, args.program_id
+        );
+        let client = solana_client::nonblocking::rpc_client::RpcClient::new(config.rpc_url.clone());
+        let stats =
+            backfill::backfill_recent(&client, &pool, &args.program_id, max_txs, args.min_swaps)
+                .await?;
+        println!(
+            "回填完成：交易 {} 笔（失败跳过 {}），解析出 swap {} 条，新入库 {} 条，slot {}..={}",
+            stats.transactions,
+            stats.skipped_failed,
+            stats.swaps_parsed,
+            stats.swaps_inserted,
+            stats.slots.0,
+            stats.slots.1
+        );
+        return Ok(());
+    }
+
+    info!("Start slot: {}", config.start_slot);
+    info!("RPC URL: {}", config.rpc_url);
 
     let client = RpcClient::new(config.rpc_url.clone());
     info!("Connecting to Solana RPC at: {}", client.url());

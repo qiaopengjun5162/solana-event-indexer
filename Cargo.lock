@@ -3963,6 +3963,8 @@ dependencies = [
  "solana-account-decoder-client-types",
  "solana-client",
  "solana-message",
+ "solana-pubkey",
+ "solana-signature",
  "solana-transaction-status",
  "sqlx",
  "tokio",

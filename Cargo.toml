@@ -28,6 +28,8 @@ num-traits = "0.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["default"] }
 solana-client = "2.3.4"
+solana-pubkey = "2.4"
+solana-signature = "2.3"
 solana-transaction-status = "2.3.4"
 sqlx = { version = "0.8.6", features = [
   "postgres",

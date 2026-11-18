@@ -8,7 +8,12 @@ use solana_transaction_status::{
 
 use crate::models::SwapEvent;
 
-const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggLgHpjANv64BHgf7Ct91";
+/// Raydium CPMM（CP-Swap）主网程序地址。
+///
+/// 取自官方文档 reference/program-addresses：`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`。
+/// 此前这里写成了 `...NunggLgHpjANv64BHgf7Ct91`——前 24 位相同、后半段不同，
+/// 链上根本不存在这个账户，导致签名查询永远是空数组。
+pub const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
 #[derive(Default)]
