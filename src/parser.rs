@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use solana_transaction_status::{
@@ -30,18 +28,6 @@ const SWAP_BASE_OUTPUT_DISCRIMINATOR: [u8; 8] = [0x37, 0xd9, 0x62, 0x56, 0xa3, 0
 const ACCOUNT_POOL_STATE: usize = 3;
 const ACCOUNT_INPUT_VAULT: usize = 6;
 const ACCOUNT_OUTPUT_VAULT: usize = 7;
-
-#[derive(Default)]
-struct BalanceInfo {
-    pre: Option<(String, String, u8, u64)>,
-    post: Option<(String, String, u8, u64)>,
-}
-
-struct Delta {
-    mint: String,
-    decimals: u8,
-    raw_delta: i64,
-}
 
 struct BalanceChange {
     mint: String,
@@ -174,90 +160,6 @@ fn extract_swap_instructions(
     found
 }
 
-fn extract_swaps_heuristic(
-    signature: &str,
-    slot: u64,
-    block_time: Option<DateTime<Utc>>,
-    meta: &UiTransactionStatusMeta,
-    transaction: &EncodedTransaction,
-) -> Vec<SwapEvent> {
-    let account_keys = account_keys_from_transaction(transaction, meta);
-    let fee_payer = account_keys.first().cloned().unwrap_or_default();
-
-    let mut balances: HashMap<u8, BalanceInfo> = HashMap::new();
-    let empty_balances = Vec::new();
-    for b in meta.pre_token_balances.as_ref().unwrap_or(&empty_balances) {
-        if let Ok(amount) = b.ui_token_amount.amount.parse::<u64>() {
-            balances.entry(b.account_index).or_default().pre = Some((
-                b.mint.clone(),
-                b.owner.as_ref().unwrap_or(&String::new()).clone(),
-                b.ui_token_amount.decimals,
-                amount,
-            ));
-        }
-    }
-    let empty_balances = Vec::new();
-    for b in meta.post_token_balances.as_ref().unwrap_or(&empty_balances) {
-        if let Ok(amount) = b.ui_token_amount.amount.parse::<u64>() {
-            balances.entry(b.account_index).or_default().post = Some((
-                b.mint.clone(),
-                b.owner.as_ref().unwrap_or(&String::new()).clone(),
-                b.ui_token_amount.decimals,
-                amount,
-            ));
-        }
-    }
-
-    let mut deltas_by_owner: HashMap<String, Vec<Delta>> = HashMap::new();
-    for (_idx, info) in balances {
-        if let (Some(pre), Some(post)) = (&info.pre, &info.post) {
-            let raw_delta = post.3 as i64 - pre.3 as i64;
-            if raw_delta == 0 {
-                continue;
-            }
-            deltas_by_owner.entry(pre.1.clone()).or_default().push(Delta {
-                mint: pre.0.clone(),
-                decimals: pre.2,
-                raw_delta,
-            });
-        }
-    }
-
-    let mut swaps = Vec::new();
-    for (owner, deltas) in deltas_by_owner {
-        if owner == fee_payer || deltas.len() != 2 {
-            continue;
-        }
-        let in_delta = deltas.iter().find(|d| d.raw_delta > 0);
-        let out_delta = deltas.iter().find(|d| d.raw_delta < 0);
-        let (Some(in_d), Some(out_d)) = (in_delta, out_delta) else {
-            continue;
-        };
-
-        let amount_in = BigDecimal::from(in_d.raw_delta as u64)
-            / BigDecimal::from(10u64.pow(in_d.decimals as u32));
-        let amount_out = BigDecimal::from(out_d.raw_delta.unsigned_abs())
-            / BigDecimal::from(10u64.pow(out_d.decimals as u32));
-
-        swaps.push(SwapEvent {
-            signature: signature.to_string(),
-            slot,
-            block_time,
-            program_id: RAYDIUM_CPMM_PROGRAM_ID.to_string(),
-            pool_id: owner.clone(),
-            token_in: in_d.mint.clone(),
-            token_out: out_d.mint.clone(),
-            amount_in_raw: in_d.raw_delta as u64,
-            amount_out_raw: out_d.raw_delta.unsigned_abs(),
-            amount_in,
-            amount_out,
-            priority_fee_lamports: meta.fee,
-        });
-    }
-
-    swaps
-}
-
 pub fn extract_swaps(
     signature: &str,
     slot: u64,
@@ -269,7 +171,15 @@ pub fn extract_swaps(
 
     let swap_ixs = extract_swap_instructions(transaction, meta, &account_keys);
     if swap_ixs.is_empty() {
-        return extract_swaps_heuristic(signature, slot, block_time, meta, transaction);
+        // 解不出 swap_base_input / swap_base_output 就不猜。
+        //
+        // 这里以前会退到一个「同一 owner 下两个 token 余额一增一减」的启发式：
+        // 它能把漏解析的交易捞回来，代价是 pool_id 只能填金库 owner（一个派生
+        // PDA），而那个地址在链上没有账户数据，之后想读储备必然失败。扩样本后
+        // 250 个池子里有 8 个是这么来的，全是 Whirlpool 的池子被顺手扫进来。
+        // 宁可少一行可解析的数据，也不要多一行不可解析的噪声——调用方用
+        // `txs_without_swap` 统计这类交易，需要补解析时看计数即可。
+        return Vec::new();
     }
 
     let mut swaps = Vec::new();
@@ -598,7 +508,10 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_swap_parsing_fallback() {
+    fn undecodable_swap_is_dropped_not_guessed() {
+        // 同一个交易里某个 owner 的两个 token 余额一增一减，但指令判别码不认识。
+        // 以前这里会写出 pool_id = 金库 owner 的行，那个地址链上没有账户，
+        // 读储备必然失败。现在必须返回空。
         let keys = vec![
             FEE_PAYER.to_string(),
             INPUT_MINT.to_string(),
@@ -623,12 +536,10 @@ mod tests {
         ];
         let meta = meta_with_balances(5000, pre, post);
         let swaps = extract_swaps("sig", 100, None, &meta, &tx);
-        assert_eq!(swaps.len(), 1);
-        let swap = &swaps[0];
-        assert_eq!(swap.token_in, INPUT_MINT);
-        assert_eq!(swap.token_out, OUTPUT_MINT);
-        assert_eq!(swap.amount_in_raw, 100_000_000);
-        assert_eq!(swap.amount_out_raw, 100_000_000);
-        assert_eq!(swap.pool_id, owner);
+        assert!(
+            swaps.is_empty(),
+            "解不出 CPMM 指令的交易不能靠余额差猜出 swap，实际写出 {} 行",
+            swaps.len()
+        );
     }
 }

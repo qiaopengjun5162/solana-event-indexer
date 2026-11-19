@@ -25,7 +25,8 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 | Reserves report CLI (`--reserves-report`) | Done | Yes (live vault balances + VWAP deviation) |
 | Size-aware arbitrage sizing (`src/arb.rs`) | Done | Yes (9 unit tests + live run: optimal 0.0059 units) |
 | Size ladder (`--reserves-report`) | Done | Yes (live run: ×5 of optimal is already negative) |
-| Sample expansion (8k CPMM txs) | Done | Yes — 1771 swaps / 619 pools / 269k slots |
+| Sample expansion (8k CPMM txs) | Done | Yes — 2090 swaps / 674 pools / 269k slots |
+| Undecodable swap policy (`src/parser.rs`) | Done | Yes — 213/213 new pools resolve as CPMM |
 | `cargo deny` license/advisory check | Done | Yes |
 
 ## What changed in this pass
@@ -271,12 +272,15 @@ column is the measurement of that.
   fee. Gas, priority fees, multi-hop routes and being front-run are all missing —
   the number it prints is an upper bound, and on single-digit-unit pools it is a
   very small one.
-- **The heuristic fallback still writes rows.** A transaction with no CPMM swap
-  instruction (or one whose instruction we fail to decode) falls back to
-  "any two token deltas under one owner", and `pool_id` becomes that owner.
-  The reserves report surfaces these as `owner … 不是 CPMM 程序`; 8 of 250 in the
-  current sample (Whirlpool pools swept in by the owner heuristic). Better: drop
-  the row and count it, instead of storing an address that cannot be resolved.
+- **Undecodable swaps are now dropped, not guessed (fixed this pass).** The old
+  fallback wrote `pool_id = vault owner` for any owner with two offsetting token
+  deltas; that address has no account data, so the reserves report could never
+  resolve it (8 of 250 pools in the pre-fix sample, all Whirlpool pools swept in
+  sideways). `extract_swaps` now returns nothing when the discriminator is not
+  recognised, and `backfill` counts those transactions as `txs_without_swap`
+  (10 of 150 in the verification run). Verified: 213 newly written pools all have
+  `owner = CPMMoo8…`, zero unresolvable. The 8 legacy rows are still in the
+  database — they need a one-off prune, not a re-run.
 - **Discriminators and account layout may drift** with program upgrades. They are
   now derived from `sha256("global:<name>")` and covered by tests, but a new
   instruction variant would need a new constant.
