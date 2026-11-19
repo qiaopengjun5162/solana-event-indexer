@@ -409,9 +409,10 @@ async fn main() -> anyhow::Result<()> {
             backfill::backfill_recent(&client, &pool, &args.program_id, max_txs, args.min_swaps)
                 .await?;
         println!(
-            "回填完成：交易 {} 笔（失败跳过 {}），解析出 swap {} 条，新入库 {} 条，slot {}..={}",
+            "回填完成：交易 {} 笔（失败跳过 {}，未解析出 swap {}），解析出 swap {} 条，新入库 {} 条，slot {}..={}",
             stats.transactions,
             stats.skipped_failed,
+            stats.txs_without_swap,
             stats.swaps_parsed,
             stats.swaps_inserted,
             stats.slots.0,

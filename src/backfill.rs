@@ -27,6 +27,12 @@ pub struct BackfillStats {
     pub skipped_failed: usize,
     pub swaps_parsed: usize,
     pub swaps_inserted: u64,
+    /// 成功交易里一条 swap 都没解析出来的笔数。
+    ///
+    /// 这些交易要么压根不是在 swap（加/撤流动性、创建池子），要么是新的指令
+    /// 变体（判别码还没覆盖）。以前它们会被启发式兜底写成 pool_id = 金库 owner
+    /// 的脏行，现在只计数、不落库——这个数字变大就是「该补解析了」的信号。
+    pub txs_without_swap: usize,
     pub slots: (u64, u64),
 }
 
@@ -141,6 +147,9 @@ pub async fn backfill_recent(
                 &transaction,
             );
             stats.swaps_parsed += swaps.len();
+            if swaps.is_empty() {
+                stats.txs_without_swap += 1;
+            }
 
             for swap in &swaps {
                 match db::insert_swap(pool, swap).await {
