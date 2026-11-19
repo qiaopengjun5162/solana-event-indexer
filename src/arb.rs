@@ -1,18 +1,27 @@
-//! 规模感知的两池套利测算。
+//! 规模感知的套利测算：两池同币对，以及 SOL 起点的多跳闭环。
 //!
 //! 中间价只能回答「有没有价差」，回答不了「值不值得做」。价差 2% 听起来很美，
 //! 但如果只有在某个池子里砸进去 3 个 token 才成立，那这笔机会在手续费和 gas
 //! 面前等于零。这里用恒定乘积公式把「投多少、换多少、剩多少」算出来。
 //!
+//! 多跳部分回答另一个问题：**跨币种的价差不在同一个池子里**。SOL → A → B → SOL
+//! 这样一圈回来如果还剩下 SOL，说明三块池子之间存在真实的相对错价——两池模型
+//! 永远看不到这种机会，因为没有任何一对池子是同一个币对。
+//!
 //! 模型假设（都会让结果**偏乐观**，因此报告里必须一起交代）：
 //!
-//! - 只走两个池子，不考虑多跳路径与聚合器拆单
 //! - 每边扣 25 bps（Raydium CPMM 的 `trade_fee_rate`），从投入额里先扣
-//! - 不含 gas、优先费、报价与成交之间的 slot 漂移
+//! - 不含 gas、优先费、报价与成交之间的 slot 漂移（调用方可用 `fee_floor_sol` 折抵）
 //! - 储备在交易过程中不变（真实情况是自打自跌，所以实际利润只会更低）
+//! - 多跳只**枚举**长度固定的简单闭环，不做拆单与跨程序路由
+
+use std::collections::{HashMap, HashSet};
 
 use crate::pool_state::ReserveQuote;
 use crate::spread::RAYDIUM_CPMM_FEE_BPS;
+
+/// wrapped SOL 的 mint。多跳闭环以它为起点，利润才和 lamports 计价的手续费可比。
+pub const WRAPPED_SOL: &str = "So11111111111111111111111111111111111111112";
 
 /// 一边的手续费比例，25 bps = 0.25%。
 pub fn fee_per_side() -> f64 {
@@ -120,6 +129,252 @@ pub fn best_two_pool_arb(cheap: &ReserveQuote, dear: &ReserveQuote) -> Option<Tw
         profit_bps: profit / amount_in * 10_000.0,
         pool_impact: amount_in / cheap.quote_reserve,
     })
+}
+
+/// 多跳路径上的一条腿：往 `in_reserve` 的池子里砸 `amount_in`，换出 `out_reserve` 币。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leg {
+    pub pool_id: String,
+    pub in_mint: String,
+    pub out_mint: String,
+    /// 池子里 `in_mint` 的储备（UI 数量，已按 decimals 缩放）。
+    pub in_reserve: f64,
+    /// 池子里 `out_mint` 的储备。
+    pub out_reserve: f64,
+}
+
+/// 一条回到起点的闭环：`legs` 首尾相接，最后一腿的输出币就是起点币。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cycle {
+    pub start_mint: String,
+    pub legs: Vec<Leg>,
+}
+
+impl Cycle {
+    /// 依次经过的币（不含回到起点的那一次）。
+    pub fn mints(&self) -> Vec<&str> {
+        let mut out = vec![self.start_mint.as_str()];
+        for leg in &self.legs {
+            out.push(leg.out_mint.as_str());
+        }
+        out
+    }
+
+    pub fn pools(&self) -> Vec<&str> {
+        self.legs.iter().map(|l| l.pool_id.as_str()).collect()
+    }
+}
+
+/// 多跳闭环的最优解。`profit` 以 `start_mint` 计价，未扣 gas。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleArb {
+    pub amount_in: f64,
+    pub amount_out: f64,
+    pub profit: f64,
+    pub profit_bps: f64,
+    /// 最吃储备的那条腿的消耗比例。
+    pub worst_impact: f64,
+    pub hops: usize,
+}
+
+/// 单条腿的恒定乘积成交：先扣费再进曲线，和链上 `swap_base_input` 一致。
+pub fn leg_out(leg: &Leg, amount_in: f64) -> f64 {
+    if amount_in <= 0.0 || leg.in_reserve <= 0.0 || leg.out_reserve <= 0.0 {
+        return 0.0;
+    }
+    let effective = amount_in * (1.0 - fee_per_side());
+    leg.out_reserve * effective / (leg.in_reserve + effective)
+}
+
+/// 走完整条闭环后拿回多少起始币。
+pub fn cycle_out(cycle: &Cycle, amount_in: f64) -> f64 {
+    run_cycle(cycle, amount_in).map(|(out, _)| out).unwrap_or(0.0)
+}
+
+/// 闭环在指定规模下的净损益（起始币计价，未扣 gas）。
+pub fn cycle_profit_at_size(cycle: &Cycle, amount_in: f64) -> f64 {
+    match run_cycle(cycle, amount_in) {
+        Some((out, _)) => out - amount_in,
+        None => f64::NEG_INFINITY,
+    }
+}
+
+/// 逐腿推进，返回 (最终拿回的数量, 各腿里最吃储备的比例)。
+fn run_cycle(cycle: &Cycle, amount_in: f64) -> Option<(f64, f64)> {
+    if amount_in <= 0.0 || cycle.legs.len() < 2 {
+        return None;
+    }
+    if cycle.legs.last()?.out_mint != cycle.start_mint {
+        return None;
+    }
+    // 首尾相接是前提：中间断了一节，输入输出就不是同一币种，利润没有意义
+    for pair in cycle.legs.windows(2) {
+        if pair[0].out_mint != pair[1].in_mint {
+            return None;
+        }
+    }
+    let mut amount = amount_in;
+    let mut worst: f64 = 0.0;
+    for leg in &cycle.legs {
+        if leg.in_reserve <= 0.0 {
+            return None;
+        }
+        worst = worst.max(amount / leg.in_reserve);
+        amount = leg_out(leg, amount);
+        if amount <= 0.0 {
+            return None;
+        }
+    }
+    Some((amount, worst))
+}
+
+/// 求闭环的最优投入规模。
+///
+/// 三跳（乃至更多跳）下，`out(x)` 仍是单调递增的凹函数，所以 `out(x) - x` 单峰，
+/// 三分搜索同样成立。无利可图（手续费吃掉全部错价）时返回 `None`。
+pub fn best_cycle_arb(cycle: &Cycle) -> Option<CycleArb> {
+    let first = cycle.legs.first()?;
+    let hi = first.in_reserve;
+    if hi <= 0.0 || !hi.is_finite() || run_cycle(cycle, hi * 1e-9).is_none() {
+        return None;
+    }
+
+    let (mut lo, mut hi) = (hi * 1e-9, hi);
+    for _ in 0..200 {
+        let m1 = lo + (hi - lo) / 3.0;
+        let m2 = hi - (hi - lo) / 3.0;
+        if cycle_profit_at_size(cycle, m1) < cycle_profit_at_size(cycle, m2) {
+            lo = m1;
+        } else {
+            hi = m2;
+        }
+    }
+
+    let amount_in = (lo + hi) / 2.0;
+    let (amount_out, worst_impact) = run_cycle(cycle, amount_in)?;
+    let profit = amount_out - amount_in;
+    if !profit.is_finite() || profit <= 0.0 {
+        return None;
+    }
+
+    Some(CycleArb {
+        amount_in,
+        amount_out,
+        profit,
+        profit_bps: profit / amount_in * 10_000.0,
+        worst_impact,
+        hops: cycle.legs.len(),
+    })
+}
+
+/// 一笔交易的固定成本下限（SOL）：签名费 5000 lamports + 优先费。
+///
+/// 只有起点是 SOL 的闭环，利润才和这个数字同量纲可直接比较——这也是把
+/// 多跳起点钉在 wrapped SOL 上的原因。
+pub fn fee_floor_sol(priority_fee_lamports: u64) -> f64 {
+    (5_000 + priority_fee_lamports) as f64 / 1_000_000_000.0
+}
+
+/// 枚举从 `start_mint` 出发、长度恰为 `hops` 的简单闭环。
+///
+/// 「简单」= 同一池子不重复走、中间币种不重复出现。三条腿的三跳闭环
+/// 覆盖 SOL → A → B → SOL，这是两池模型完全看不到的一类错价。
+pub fn find_cycles(quotes: &[ReserveQuote], start_mint: &str, hops: usize) -> Vec<Cycle> {
+    if hops < 2 {
+        return Vec::new();
+    }
+
+    // mint → 从它出发的所有腿（每个池子两个方向各一条）
+    let mut adj: HashMap<String, Vec<Leg>> = HashMap::new();
+    for q in quotes {
+        if q.base_reserve <= 0.0 || q.quote_reserve <= 0.0 {
+            continue;
+        }
+        adj.entry(q.base_mint.clone()).or_default().push(Leg {
+            pool_id: q.pool_id.clone(),
+            in_mint: q.base_mint.clone(),
+            out_mint: q.quote_mint.clone(),
+            in_reserve: q.base_reserve,
+            out_reserve: q.quote_reserve,
+        });
+        adj.entry(q.quote_mint.clone()).or_default().push(Leg {
+            pool_id: q.pool_id.clone(),
+            in_mint: q.quote_mint.clone(),
+            out_mint: q.base_mint.clone(),
+            in_reserve: q.quote_reserve,
+            out_reserve: q.base_reserve,
+        });
+    }
+
+    let mut out = Vec::new();
+    let mut legs = Vec::new();
+    let mut used_pools: HashSet<String> = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    walk_cycles(
+        start_mint,
+        start_mint,
+        hops,
+        &adj,
+        &mut legs,
+        &mut used_pools,
+        &mut visited,
+        &mut out,
+    );
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_cycles(
+    current: &str,
+    start: &str,
+    remaining: usize,
+    adj: &HashMap<String, Vec<Leg>>,
+    legs: &mut Vec<Leg>,
+    used_pools: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<Cycle>,
+) {
+    let Some(nexts) = adj.get(current) else {
+        return;
+    };
+    for leg in nexts {
+        if used_pools.contains(&leg.pool_id) {
+            continue;
+        }
+        let closes = leg.out_mint == start;
+        if closes {
+            if remaining == 1 {
+                legs.push(leg.clone());
+                out.push(Cycle {
+                    start_mint: start.to_string(),
+                    legs: legs.clone(),
+                });
+                legs.pop();
+            }
+            // 提前回到起点 = 长度不足，不是我们要的闭环
+            continue;
+        }
+        if remaining == 1 || visited.contains(&leg.out_mint) {
+            continue;
+        }
+
+        legs.push(leg.clone());
+        used_pools.insert(leg.pool_id.clone());
+        visited.insert(leg.out_mint.clone());
+        walk_cycles(
+            &leg.out_mint,
+            start,
+            remaining - 1,
+            adj,
+            legs,
+            used_pools,
+            visited,
+            out,
+        );
+        visited.remove(&leg.out_mint);
+        used_pools.remove(&leg.pool_id);
+        legs.pop();
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +496,140 @@ mod tests {
         let dear = quote("DE", 1_000.0, 1_002_000.0);
         assert!(profit_at_size(&cheap, &dear, 10.0) < 0.0);
         assert!(profit_at_size(&cheap, &dear, 0.0).is_infinite());
+    }
+
+    // ---- 多跳闭环 ----
+
+    fn mk(
+        pool: &str,
+        base: &str,
+        quote_mint: &str,
+        base_reserve: f64,
+        quote_reserve: f64,
+    ) -> ReserveQuote {
+        ReserveQuote {
+            pool_id: pool.to_string(),
+            base_mint: base.to_string(),
+            quote_mint: quote_mint.to_string(),
+            base_reserve,
+            quote_reserve,
+            base_decimals: 6,
+            quote_decimals: 6,
+            price: quote_reserve / base_reserve,
+            slot: 100,
+        }
+    }
+
+    /// SOL → AAA → BBB（三者都按 1:1 定价）
+    fn flat_triangle(tail_sol_reserve: f64) -> Vec<ReserveQuote> {
+        vec![
+            mk("P1", "SOL", "AAA", 1_000.0, 1_000.0),
+            mk("P2", "AAA", "BBB", 1_000.0, 1_000.0),
+            // BBB → SOL 的兑换率 = quote/base = tail_sol_reserve / 1000
+            mk("P3", "BBB", "SOL", 1_000.0, tail_sol_reserve),
+        ]
+    }
+
+    #[test]
+    fn leg_out_agrees_with_two_pool_helpers() {
+        let p = quote("A", 1_000.0, 1_000_000.0);
+        let buy = Leg {
+            pool_id: "A".into(),
+            in_mint: "QUOTE".into(),
+            out_mint: "BASE".into(),
+            in_reserve: p.quote_reserve,
+            out_reserve: p.base_reserve,
+        };
+        let sell = Leg {
+            pool_id: "A".into(),
+            in_mint: "BASE".into(),
+            out_mint: "QUOTE".into(),
+            in_reserve: p.base_reserve,
+            out_reserve: p.quote_reserve,
+        };
+        assert!(
+            (leg_out(&buy, 1_000.0)
+                - buy_base_with_quote(p.quote_reserve, p.base_reserve, 1_000.0))
+            .abs()
+                < 1e-9
+        );
+        assert!(
+            (leg_out(&sell, 10.0) - sell_base_for_quote(p.base_reserve, p.quote_reserve, 10.0))
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn find_cycles_sees_both_directions() {
+        let cycles = find_cycles(&flat_triangle(1_000.0), "SOL", 3);
+        assert_eq!(cycles.len(), 2, "三池三角应当只有正反两条闭环");
+        for c in &cycles {
+            assert_eq!(c.legs.len(), 3);
+            assert_eq!(
+                c.mints(),
+                vec!["SOL", c.legs[0].out_mint.as_str(), c.legs[1].out_mint.as_str(), "SOL"]
+            );
+        }
+    }
+
+    #[test]
+    fn two_pools_never_make_a_three_hop_cycle() {
+        let pools = vec![
+            mk("P1", "SOL", "AAA", 1_000.0, 1_000.0),
+            mk("P2", "AAA", "SOL", 1_000.0, 1_000.0),
+        ];
+        assert!(find_cycles(&pools, "SOL", 3).is_empty());
+    }
+
+    #[test]
+    fn flat_triangle_loses_only_fees() {
+        // 三条腿都 1:1，走一圈只剩手续费：0.9975³ ≈ 0.9925，必亏
+        let cycles = find_cycles(&flat_triangle(1_000.0), "SOL", 3);
+        for c in &cycles {
+            assert!(cycle_profit_at_size(c, 10.0) < 0.0);
+            assert!(best_cycle_arb(c).is_none(), "没有错价就不该报出机会");
+        }
+    }
+
+    #[test]
+    fn mispriced_tail_makes_cycle_profitable() {
+        // BBB → SOL 这条腿按 2 SOL / BBB 定价，等于白送一倍
+        let cycles = find_cycles(&flat_triangle(2_000.0), "SOL", 3);
+        let profitable: Vec<_> = cycles.iter().filter_map(best_cycle_arb).collect();
+        assert_eq!(
+            profitable.len(),
+            1,
+            "只有正方向能赚，反方向应当被手续费吃掉"
+        );
+
+        let arb_result = &profitable[0];
+        assert!(arb_result.profit > 0.0);
+        assert_eq!(arb_result.hops, 3);
+        assert!(arb_result.worst_impact > 0.0 && arb_result.worst_impact <= 1.0);
+
+        // 放大十倍吃掉更多储备，利润必须下降
+        let big = cycles
+            .iter()
+            .map(|c| cycle_profit_at_size(c, arb_result.amount_in * 10.0))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(big < arb_result.profit, "放大后利润应当被价格冲击吃掉");
+    }
+
+    #[test]
+    fn broken_cycle_is_rejected() {
+        let mut c = find_cycles(&flat_triangle(2_000.0), "SOL", 3)
+            .into_iter()
+            .next()
+            .expect("应当有闭环");
+        c.legs[1].in_mint = "OTHER".into(); // 腿与腿之间断开
+        assert!(cycle_out(&c, 1.0) == 0.0);
+        assert!(best_cycle_arb(&c).is_none());
+    }
+
+    #[test]
+    fn fee_floor_is_lamports_over_a_billion() {
+        assert!((fee_floor_sol(0) - 0.000005).abs() < 1e-12);
+        assert!((fee_floor_sol(100_000) - 0.000105).abs() < 1e-12);
     }
 }

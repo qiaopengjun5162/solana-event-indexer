@@ -67,6 +67,22 @@ struct Args {
     /// How many of the most active pools to load reserves for.
     #[arg(long, default_value_t = 200)]
     pool_limit: i64,
+
+    /// Evaluate SOL-anchored multi-hop cycles (SOL → A → B → SOL) against live
+    /// reserves and exit. Answers what the two-pool report cannot see: whether
+    /// cross-token mispricing leaves SOL on the table after all three fees.
+    #[arg(long)]
+    cycles_report: bool,
+    /// Legs per cycle. 3 = triangle; 2 degenerates to the two-pool case.
+    #[arg(long, default_value_t = 3)]
+    cycle_hops: usize,
+    /// How many cycles to print, sorted by model profit.
+    #[arg(long, default_value_t = 10)]
+    cycles_top: usize,
+    /// Priority fee in lamports, added to the 5000-lamport signature fee when
+    /// checking whether a cycle clears its fixed cost.
+    #[arg(long, default_value_t = 0)]
+    priority_fee_lamports: u64,
 }
 
 fn process_transaction(
@@ -368,6 +384,145 @@ async fn report_reserves(
     Ok(())
 }
 
+/// 多跳闭环报告：SOL 出去转一圈回来，还剩多少 SOL。
+///
+/// 两池报告只能在「同一个币对的两个池子」之间找价差。真实的相对错价经常长在
+/// 三个币的价格关系上：SOL/A、A/B、B/SOL 各自看都合理，乘起来却不等于 1。
+/// 这类机会两池模型永远看不到，因为它没有任何一对池子是同一个币对。
+///
+/// 起点钉在 wrapped SOL 上不是图省事——只有这样利润才和 lamports 计价的签名费
+/// 同量纲，才能回答「赚的钱够不够付那一笔固定成本」。
+async fn report_cycles(
+    client: &solana_client::nonblocking::rpc_client::RpcClient,
+    pool: &sqlx::PgPool,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let (swaps, pools, max_slot) = db::stats(pool).await?;
+    if pools == 0 {
+        println!("数据库里还没有 swap，先跑 `--backfill 200` 灌一批真实数据。");
+        return Ok(());
+    }
+
+    let pool_ids = db::top_pools(pool, args.pool_limit).await?;
+    println!(
+        "库内 {} 笔 swap / {} 个 pool_id / 最高 slot {}",
+        swaps, pools, max_slot
+    );
+    println!("读取前 {} 个最活跃池子的储备...", pool_ids.len());
+    let snapshot = pool_state::fetch_reserves(client, &pool_ids).await?;
+    println!(
+        "解析成功 {} 个池子，账户缺失 {} 个，解析失败 {} 个，金库读不到 {} 个（查询 slot {}）",
+        snapshot.quotes.len(),
+        snapshot.missing.len(),
+        snapshot.unparsable.len(),
+        snapshot.missing_vaults,
+        snapshot.slot
+    );
+    if snapshot.quotes.is_empty() {
+        println!("没有读到任何储备，闭环无从算起。");
+        return Ok(());
+    }
+
+    let cycles = arb::find_cycles(&snapshot.quotes, arb::WRAPPED_SOL, args.cycle_hops);
+    let fee_sol = arb::fee_floor_sol(args.priority_fee_lamports);
+    println!(
+        "{} 跳闭环候选 {} 条（起点 wrapped SOL）；固定成本 {} lamports = {:.6} SOL",
+        args.cycle_hops,
+        cycles.len(),
+        5_000 + args.priority_fee_lamports,
+        fee_sol
+    );
+
+    let mut scored: Vec<(arb::CycleArb, &arb::Cycle)> = cycles
+        .iter()
+        .filter_map(|cycle| arb::best_cycle_arb(cycle).map(|result| (result, cycle)))
+        .collect();
+    scored.sort_by(|a, b| b.0.profit.partial_cmp(&a.0.profit).unwrap_or(std::cmp::Ordering::Equal));
+    let clears_fee = scored.iter().filter(|(r, _)| r.profit > fee_sol).count();
+
+    // 同一串币种往往对应多个池子组合（SOL→X→USDC→SOL 可能有七八种走法）。
+    // 不归并的话，榜首会被同一类机会刷屏，看不出到底有几种错价。
+    let mut by_path: HashMap<String, (arb::CycleArb, &arb::Cycle, usize)> = HashMap::new();
+    for (result, cycle) in &scored {
+        let key = cycle.mints().join(">");
+        match by_path.get_mut(&key) {
+            Some(entry) if entry.0.profit >= result.profit => entry.2 += 1,
+            Some(entry) => {
+                let variants = entry.2 + 1;
+                *entry = (result.clone(), cycle, variants);
+            }
+            None => {
+                by_path.insert(key, (result.clone(), cycle, 1));
+            }
+        }
+    }
+    let mut paths: Vec<(arb::CycleArb, &arb::Cycle, usize)> = by_path.into_values().collect();
+    paths.sort_by(|a, b| b.0.profit.partial_cmp(&a.0.profit).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!(
+        "模型内盈利 {} 条，落在 {} 条不同币种路径上；扣掉固定成本后仍为正 {} 条",
+        scored.len(),
+        paths.len(),
+        clears_fee
+    );
+    // 利润的绝对值比 bps 更能说明问题：+1136 bps 听着很多，投 0.0175 SOL 只赚 0.002 SOL。
+    let bucket = |floor: f64| scored.iter().filter(|(r, _)| r.profit >= floor).count();
+    let best = scored.first().map(|(r, _)| r.profit).unwrap_or(0.0);
+    println!(
+        "利润分布（SOL，未扣 gas）：≥0.1 {} / 0.01–0.1 {} / 0.001–0.01 {} / <0.001 {}；最高 {:.6} SOL",
+        bucket(0.1),
+        bucket(0.01) - bucket(0.1),
+        bucket(0.001) - bucket(0.01),
+        bucket(0.0) - bucket(0.001),
+        best
+    );
+    if paths.is_empty() {
+        println!();
+        println!("没有任何闭环能盖住每条腿 25 bps 的手续费——三块池子之间没有可利用的相对错价。");
+        return Ok(());
+    }
+    println!();
+
+    for (i, (result, cycle, variants)) in paths.iter().take(args.cycles_top).enumerate() {
+        let path = cycle.mints().iter().map(|m| short_key(m)).collect::<Vec<_>>().join(" → ");
+        let pools_path = cycle.pools().iter().map(|p| short_key(p)).collect::<Vec<_>>().join(" / ");
+        println!(
+            "{:>2}) {path}（同路径 {variants} 种走法，这是最好的一条）",
+            i + 1
+        );
+        println!("      池子：{pools_path}");
+        println!(
+            "      最优下单：投入 {} → 拿回 {}，毛利 {}（{:+.0} bps），扣固定成本后 {}",
+            fmt_price(result.amount_in),
+            fmt_price(result.amount_out),
+            fmt_price(result.profit),
+            result.profit_bps,
+            fmt_price(result.profit - fee_sol)
+        );
+        println!(
+            "      最紧的一条腿吃掉 {:.2}% 的储备",
+            result.worst_impact * 100.0
+        );
+        print!("      规模阶梯：");
+        for (multiplier, label) in [(1.0, "×1"), (5.0, "×5"), (20.0, "×20")] {
+            let amount = result.amount_in * multiplier;
+            let profit = arb::cycle_profit_at_size(cycle, amount);
+            if !profit.is_finite() {
+                continue;
+            }
+            print!(
+                "\n        {label:<5} 投入 {:<12} 盈亏 {:<14} {:+.0} bps",
+                fmt_price(amount),
+                fmt_price(profit),
+                profit / amount * 10_000.0
+            );
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -397,6 +552,11 @@ async fn main() -> anyhow::Result<()> {
     if args.reserves_report {
         let client = solana_client::nonblocking::rpc_client::RpcClient::new(config.rpc_url.clone());
         return report_reserves(&client, &pool, &args).await;
+    }
+
+    if args.cycles_report {
+        let client = solana_client::nonblocking::rpc_client::RpcClient::new(config.rpc_url.clone());
+        return report_cycles(&client, &pool, &args).await;
     }
 
     if let Some(max_txs) = args.backfill {
