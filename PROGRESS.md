@@ -25,6 +25,7 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 | Reserves report CLI (`--reserves-report`) | Done | Yes (live vault balances + VWAP deviation) |
 | Size-aware arbitrage sizing (`src/arb.rs`) | Done | Yes (9 unit tests + live run: optimal 0.0059 units) |
 | Size ladder (`--reserves-report`) | Done | Yes (live run: ×5 of optimal is already negative) |
+| Multi-hop cycles (`--cycles-report`) | Done | Yes — 928 cycles / 367 profitable / best 0.002 SOL |
 | Sample expansion (8k CPMM txs) | Done | Yes — 2090 swaps / 674 pools / 269k slots |
 | Undecodable swap policy (`src/parser.rs`) | Done | Yes — 213/213 new pools resolve as CPMM |
 | `cargo deny` license/advisory check | Done | Yes |
@@ -241,18 +242,59 @@ a round trip in one pool must lose (fees, then price impact); identical pools
 must yield `None`; a 0.2% spread must die on 50 bps of fees; a larger
 mispricing must yield more profit; and the optimum must respect pool capacity.
 
-## Verification commands run
+### 8. Multi-hop: the mispricing that has no pair
 
+The two-pool model can only compare pools of the *same* pair. Most relative
+mispricing does not live there — it lives in the ratio between three tokens:
+SOL/A, A/B and B/SOL each look sane, but multiplied together they do not return
+1. `--cycles-report` enumerates simple cycles of N legs starting and ending at
+wrapped SOL, fills every leg with the same constant-product rule, and
+ternary-searches the whole path (`out(x)` stays concave, so `out(x) - x` stays
+single-peaked).
+
+Anchoring on SOL is not cosmetic. Profit lands in SOL, the same unit as the
+5000-lamport signature fee, so the report subtracts a fixed cost instead of
+hand-waving "gas is small". `--priority-fee-lamports` adds the priority fee.
+
+Live run, 660 pools, slot 471,267,313, with a 50k-lamport priority fee:
+
+```
+3 跳闭环候选 928 条（起点 wrapped SOL）；固定成本 55000 lamports = 0.000055 SOL
+模型内盈利 367 条，落在 117 条不同币种路径上；扣掉固定成本后仍为正 172 条
+利润分布（SOL，未扣 gas）：≥0.1 0 / 0.01–0.1 0 / 0.001–0.01 7 / <0.001 360；最高 0.002011 SOL
+```
+
+| path | pools | optimal in | gross bps | ×5 bps | worst leg impact |
+|---|---|---|---|---|---|
+| SOL → JA8JfHs6 → USDC → SOL | 3BA1Nd6Q / 4kUJa9hq / GBnkXkgm | 0.017609 | +1142 | -2091 | 5.52% |
+| SOL → 76rTxzzt → USD1… → SOL | E9oGC72m / Gvy9HeXq / EY8q7JwE | 0.029213 | +618 | -1388 | 3.31% |
+| SOL → WgqMUdYQ → USDC → SOL | BekkkgcL / 62Xtz5Lx / GBnkXkgm | 0.019140 | +659 | -1455 | 5.63% |
+
+The result is the same shape as the two-pool case, only more emphatic. Multi-hop
+does find far more opportunities (367 vs 8), but **the single best one in the
+whole sample is 0.002 SOL — about $0.40 at SOL ≈ $200 — and 360 of the 367 pay
+less than 0.001 SOL.** Every printed cycle is negative at ×5. Route coverage was
+never the bottleneck; depth is. Three-hop arbitrage on this market is not a
+strategy, it is a rounding error with extra steps.
+
+Consistency check, and it is the reason to trust the leg math: setting
+`--cycle-hops 2` degenerates to the two-pool model, and it reproduces that
+report exactly (`FmRjg2XV/So111` → +804 bps at 0.008502, same figure the
+reserves report prints for the same pair). The multi-hop engine is the two-pool
+engine with more legs, not a second implementation that might disagree.
+
+## Verification commands run
 ```bash
 cargo fmt
 cargo check --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets                       # 32 lib tests + 1 integration test
+cargo test --all-targets                       # 41 lib tests + 1 integration test
 psql -f migrations/002_dedupe_swaps.sql
 psql -f migrations/003_pool_id_is_pool_state.sql   # 清空旧行：pool_id 语义变了
 cargo run --release -- --backfill 700 --rpc-url https://api.mainnet-beta.solana.com
 cargo run --release -- --spread-report --window-slots 5000 --min-net-pct 0.05
-cargo run --release -- --reserves-report --pool-limit 80 --window-slots 400
+cargo run --release -- --reserves-report --pool-limit 700 --window-slots 400
+cargo run --release -- --cycles-report --pool-limit 700 --cycle-hops 3 --cycles-top 5
 ```
 
 Real-data result (2026-11-18, public mainnet RPC, after the pool-id fix):
@@ -287,22 +329,28 @@ column is the measurement of that.
 
 ## Known risks / next steps
 
-- **Sample size.** 1771 swaps over 269k slots is better, but it is still one
+- **Sample size.** 2037 swaps over 307k slots is better, but it is still one
   backfill window of a program that trades continuously; seasonality and pool
   churn are not represented.
-- **Same-pair coverage.** 235 pairs across 242 resolved pools, but only 3 pairs
-  have more than one pool. Cross-pool comparison is therefore three data points,
-  not a distribution — do not read a rate out of it.
+- **Same-pair coverage.** 660 resolved pools across 235 pairs; only 14 pairs have
+  more than one pool. That is enough to see the shape (every one of them decays
+  to negative at ×5) but not enough to call it a distribution.
 - **VWAP is a lagging estimate.** Measured against live reserves it deviates by
   tens of percent on thin pools (see above). Treat `--spread-report` as a
   trade-history summary, not a quote; use `--reserves-report` for a price.
-- **Depth is a reserve balance, not executable size.** `src/arb.rs` now computes
-  the optimal trade for a pair with constant-product fill, and the ladder shows
-  how fast it decays (×5 of the optimum is already negative on all three pairs).
-  It still assumes the reserves stay put and that the only cost is the 25 bps
-  fee. Gas, priority fees, multi-hop routes and being front-run are all missing —
-  the number it prints is an upper bound, and on single-digit-unit pools it is a
-  very small one.
+- **Depth is a reserve balance, not executable size.** `src/arb.rs` computes the
+  optimal trade for a pair (or a 2–4 leg cycle) with constant-product fill, and
+  the ladder shows how fast it decays (×5 of the optimum is negative on every
+  pair and every cycle in the sample). It still assumes the reserves stay put and
+  that the only cost is the 25 bps fee plus a fixed signature/priority fee.
+  Being front-run, failed landings and ATA rent are not modelled — the number it
+  prints is an upper bound. The absolute sizes are what matters: the best 3-hop
+  cycle in 928 pays 0.002 SOL, so the bound being loose does not rescue any of
+  them.
+- **Cycle enumeration is exhaustive only for one anchor.** Cycles must start and
+  end at wrapped SOL. A profitable loop that never touches SOL (USDC → X → Y →
+  USDC) is invisible here; adding a second anchor is cheap but every extra mint
+  multiplies the search, so it should be driven by where volume actually is.
 - **Undecodable swaps are now dropped, not guessed (fixed this pass).** The old
   fallback wrote `pool_id = vault owner` for any owner with two offsetting token
   deltas; that address has no account data, so the reserves report could never
