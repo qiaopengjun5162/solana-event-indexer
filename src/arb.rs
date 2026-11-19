@@ -23,6 +23,60 @@ use crate::spread::RAYDIUM_CPMM_FEE_BPS;
 /// wrapped SOL 的 mint。多跳闭环以它为起点，利润才和 lamports 计价的手续费可比。
 pub const WRAPPED_SOL: &str = "So11111111111111111111111111111111111111112";
 
+/// USDC 的 mint。作为第二个锚点：不含 SOL 的闭环（USDC → A → B → USDC）
+/// 在只锚定 SOL 的枚举里是完全不可见的。
+pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+/// 把命令行里写的锚点换成 mint。支持 `SOL` / `USDC` 简写，其他一律当 mint 原样用。
+pub fn resolve_anchor(name: &str) -> Option<String> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "" => None,
+        "SOL" | "WSOL" => Some(WRAPPED_SOL.to_string()),
+        "USDC" => Some(USDC.to_string()),
+        _ => {
+            let raw = name.trim();
+            // base58 的 mint 至少 32 个字符，太短的只可能是拼错的简写
+            (raw.len() >= 32).then(|| raw.to_string())
+        }
+    }
+}
+
+/// 一个单位的 `mint` 值多少 SOL，用于把任意锚点的利润折回 SOL 计价。
+///
+/// 取「与 SOL 配对、且 quote 储备最深」的那个池子的中间价：深度决定了这个
+/// 汇率有多可信，浅池的中间价会把利润凭空放大或缩小。找不到配对池就返回
+/// `None`——调用方要如实说明「这个锚点的利润无法折成 SOL」，而不是猜一个。
+pub fn sol_price_of(quotes: &[ReserveQuote], mint: &str) -> Option<f64> {
+    if mint == WRAPPED_SOL {
+        return Some(1.0);
+    }
+    let mut best: Option<(f64, f64)> = None; // (深度, SOL per mint)
+    for q in quotes {
+        if q.base_reserve <= 0.0 || q.quote_reserve <= 0.0 {
+            continue;
+        }
+        let (sol_per_mint, depth) = if q.base_mint == WRAPPED_SOL && q.quote_mint == mint {
+            // price = quote per base = mint per SOL
+            if q.price <= 0.0 {
+                continue;
+            }
+            (1.0 / q.price, q.base_reserve)
+        } else if q.quote_mint == WRAPPED_SOL && q.base_mint == mint {
+            // price = SOL per base = SOL per mint
+            (q.price, q.quote_reserve)
+        } else {
+            continue;
+        };
+        if !sol_per_mint.is_finite() || sol_per_mint <= 0.0 {
+            continue;
+        }
+        if best.is_none_or(|(d, _)| depth > d) {
+            best = Some((depth, sol_per_mint));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// 一边的手续费比例，25 bps = 0.25%。
 pub fn fee_per_side() -> f64 {
     RAYDIUM_CPMM_FEE_BPS / 10_000.0
@@ -320,6 +374,38 @@ pub fn find_cycles(quotes: &[ReserveQuote], start_mint: &str, hops: usize) -> Ve
         &mut visited,
         &mut out,
     );
+    out
+}
+
+/// 从多个锚点分别枚举闭环，并按「走过哪几个池子」去重。
+///
+/// 一个含 SOL 和 USDC 的闭环，从两个锚点都会走到它，只是起点不同。若不去重，
+/// 同一笔机会会被算两次、并且以两种计价出现在榜单上。这里以「有向腿集合」
+/// （池子 + 进出币，排序后）作指纹：起点旋转后腿集合不变，所以能去重；而正反
+/// 两条腿方向相反，指纹不同，不会被误删。
+pub fn find_cycles_from_anchors(
+    quotes: &[ReserveQuote],
+    anchors: &[String],
+    hops: usize,
+) -> Vec<Cycle> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for anchor in anchors {
+        for cycle in find_cycles(quotes, anchor, hops) {
+            // 指纹必须带方向：同一组池子的正反两条闭环是两笔不同的交易，
+            // 只按池子集合去重会把其中一条（通常是唯一能赚的那条）删掉。
+            let mut legs: Vec<String> = cycle
+                .legs
+                .iter()
+                .map(|l| format!("{}:{}>{}", l.pool_id, l.in_mint, l.out_mint))
+                .collect();
+            legs.sort_unstable();
+            let fingerprint = legs.join("|");
+            if seen.insert(fingerprint) {
+                out.push(cycle);
+            }
+        }
+    }
     out
 }
 
@@ -631,5 +717,94 @@ mod tests {
     fn fee_floor_is_lamports_over_a_billion() {
         assert!((fee_floor_sol(0) - 0.000005).abs() < 1e-12);
         assert!((fee_floor_sol(100_000) - 0.000105).abs() < 1e-12);
+    }
+
+    #[test]
+    fn anchors_resolve_from_symbols_or_full_mints() {
+        assert_eq!(resolve_anchor("SOL").as_deref(), Some(WRAPPED_SOL));
+        assert_eq!(resolve_anchor(" wsol ").as_deref(), Some(WRAPPED_SOL));
+        assert_eq!(resolve_anchor("usdc").as_deref(), Some(USDC));
+        assert_eq!(resolve_anchor(USDC).as_deref(), Some(USDC));
+        // 太短的只可能是拼错的简写，不能当 mint 用
+        assert!(resolve_anchor("USD").is_none());
+        assert!(resolve_anchor("  ").is_none());
+    }
+
+    #[test]
+    fn sol_price_reads_both_orientations() {
+        // SOL 是 base：price = USDC per SOL = 200 ⇒ 1 USDC = 0.005 SOL
+        let as_base = vec![mk("P", WRAPPED_SOL, USDC, 1.0, 200.0)];
+        // SOL 是 quote：price = SOL per USDC = 0.005
+        let as_quote = vec![mk("P", USDC, WRAPPED_SOL, 200.0, 1.0)];
+        for quotes in [as_base, as_quote] {
+            let p = sol_price_of(&quotes, USDC).expect("应当能读到 USDC 的 SOL 价");
+            assert!((p - 0.005).abs() < 1e-12);
+        }
+        // 自己换自己恒为 1，不需要任何池子
+        assert_eq!(sol_price_of(&[], WRAPPED_SOL), Some(1.0));
+        // 没有 SOL 配对池就是不猜
+        assert!(sol_price_of(&[mk("P", USDC, "AAA", 100.0, 100.0)], USDC).is_none());
+    }
+
+    #[test]
+    fn sol_price_follows_the_deepest_pool() {
+        // 浅池报 1000 USDC/SOL（1 USDC = 0.001 SOL），深池报 200（0.005 SOL）。
+        // 汇率必须取深的那一个，否则利润会被浅池的中间价放大五倍。
+        let quotes = vec![
+            mk("THIN", WRAPPED_SOL, USDC, 0.01, 10.0),
+            mk("DEEP", WRAPPED_SOL, USDC, 100.0, 20_000.0),
+        ];
+        let p = sol_price_of(&quotes, USDC).unwrap();
+        assert!((p - 0.005).abs() < 1e-12, "应当取深池的 0.005，实际 {p}");
+    }
+
+    #[test]
+    fn second_anchor_sees_loops_without_sol() {
+        // SOL → AAA → BBB → SOL 与 USDC → AAA → BBB → USDC 是两笔不同的交易
+        let quotes = vec![
+            mk("P1", WRAPPED_SOL, "AAA", 1_000.0, 1_000.0),
+            mk("P2", "AAA", "BBB", 1_000.0, 1_000.0),
+            mk("P3", "BBB", WRAPPED_SOL, 1_000.0, 1_000.0),
+            mk("P4", USDC, "AAA", 1_000.0, 1_000.0),
+            mk("P5", "BBB", USDC, 1_000.0, 1_000.0),
+        ];
+        let sol_only = find_cycles(&quotes, WRAPPED_SOL, 3);
+        let both = find_cycles_from_anchors(&quotes, &[WRAPPED_SOL.into(), USDC.into()], 3);
+        assert!(!sol_only.iter().any(|c| c.start_mint == USDC));
+        assert!(both.iter().any(|c| c.start_mint == USDC));
+        // SOL 那两条（正反两个方向）必须还在
+        assert_eq!(
+            both.iter().filter(|c| c.start_mint == WRAPPED_SOL).count(),
+            sol_only.len()
+        );
+    }
+
+    #[test]
+    fn overlap_between_anchors_is_deduped_by_pool_set() {
+        // 一条含 SOL 又有 USDC 的闭环，从两个锚点都会走到；按池子集合去重后
+        // 只能剩正反两条，不能变成四条。
+        let quotes = vec![
+            mk("P1", WRAPPED_SOL, USDC, 1_000.0, 1_000.0),
+            mk("P2", USDC, "AAA", 1_000.0, 1_000.0),
+            mk("P3", "AAA", WRAPPED_SOL, 1_000.0, 1_000.0),
+        ];
+        let both = find_cycles_from_anchors(&quotes, &[WRAPPED_SOL.into(), USDC.into()], 3);
+        assert_eq!(both.len(), 2, "正反两条，去重后不应翻倍");
+        // 两条走的是同一组池子，但方向相反，必须都保留
+        let mut directed: Vec<String> = both
+            .iter()
+            .map(|c| {
+                let mut legs: Vec<String> = c
+                    .legs
+                    .iter()
+                    .map(|l| format!("{}:{}>{}", l.pool_id, l.in_mint, l.out_mint))
+                    .collect();
+                legs.sort_unstable();
+                legs.join("|")
+            })
+            .collect();
+        directed.sort();
+        directed.dedup();
+        assert_eq!(directed.len(), 2, "正反两条的有向指纹必须不同");
     }
 }
