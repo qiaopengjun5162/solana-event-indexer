@@ -128,12 +128,21 @@ cargo run --release -- --reserves-report \
   --rpc-url https://api.mainnet-beta.solana.com --pool-limit 200
 ```
 
-The report answers three questions in order:
+The report answers four questions in order:
 
 1. How many stored `pool_id`s actually resolve to a CPMM `PoolState` on chain;
 2. For every pair with ≥ 2 pools, the instantaneous cross-pool spread (gross and
    after 50 bps of fees);
-3. How far the trade VWAP sits from the reserve price, per pool.
+3. **How big the trade can actually be** — the optimal input size, the profit it
+   leaves, and how much of the cheap pool's reserve it eats;
+4. How far the trade VWAP sits from the reserve price, per pool.
+
+Point 3 exists because a percentage spread on its own is not actionable. A live
+mainnet run printed a 2.036% net spread whose optimal trade was `0.0093` quote
+units earning `0.00009` — the two pools held `2.85` and `1.40` quote units, so
+any real order would have moved the price past the spread. Sizing is a ternary
+search over the profit curve of two constant-product pools, each charging 25 bps
+(`src/arb.rs`); it ignores gas and multi-hop routes, so it is an upper bound.
 
 Two guards are load-bearing. A length check alone is not enough — an Orca
 Whirlpool account is 653 bytes, passes a `>= 637` test, and would silently
@@ -156,6 +165,7 @@ program are verified before any field is read.
 - `src/backfill.rs`: `getSignaturesForAddress` + `getTransaction` ingestion; verifies the program account first.
 - `src/spread.rs`: direction-normalised VWAP quotes and the opportunity model (fees, gas, slot proximity).
 - `src/pool_state.rs`: CPMM `PoolState` + token-account decoding, reserve-based mid price, batched `getMultipleAccounts` reads.
+- `src/arb.rs`: size-aware two-pool arbitrage — constant-product fill, 25 bps per side, ternary search for the optimal input size.
 - `src/db.rs`: inserts swap events (dedupe via unique index) and reads the analysis window.
 - `src/main.rs`: CLI — block sync by default, plus `--backfill`, `--spread-report` and `--reserves-report` modes.
 - `examples/analyze_swaps.rs`: lists recent swaps and price stats.
