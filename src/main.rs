@@ -295,6 +295,26 @@ async fn report_reserves(
                         真实成交会因为滑点与抢跑而缩水"
                     );
                 }
+                // 规模阶梯：把最优解放大几档，让「针尖之外的亏损」可见。
+                // 单看「最优投入 0.0059」会让人以为可以再投一点，实际放大 20 倍就归零。
+                print!("      规模阶梯：");
+                for (multiplier, label) in
+                    [(1.0, "×1"), (5.0, "×5"), (20.0, "×20"), (100.0, "×100")]
+                {
+                    let amount = result.amount_in * multiplier;
+                    let profit = arb::profit_at_size(cheap, dear, amount);
+                    if !profit.is_finite() {
+                        continue;
+                    }
+                    let bps = profit / amount * 10_000.0;
+                    print!(
+                        "\n        {label:<5} 投入 {:<12} 盈亏 {:<14} {:+.0} bps",
+                        fmt_price(amount),
+                        fmt_price(profit),
+                        bps
+                    );
+                }
+                println!();
             }
             None => println!("      两池价差不足以覆盖双边手续费，没有可执行空间"),
         }

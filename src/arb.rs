@@ -55,6 +55,22 @@ pub struct TwoPoolArb {
     pub pool_impact: f64,
 }
 
+/// 在指定投入规模下的净损益（quote 计价，未扣 gas）。
+///
+/// `best_two_pool_arb` 回答「最优投多少」，这个函数回答「如果我偏要投 X 呢」。
+/// 两者一起看才能说清价差为什么不可执行：最优解是一根针尖，针尖之外迅速转负。
+pub fn profit_at_size(cheap: &ReserveQuote, dear: &ReserveQuote, amount_in: f64) -> f64 {
+    if amount_in <= 0.0 || cheap.price >= dear.price {
+        return f64::NEG_INFINITY;
+    }
+    let base_out = buy_base_with_quote(cheap.quote_reserve, cheap.base_reserve, amount_in);
+    if base_out <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let quote_out = sell_base_for_quote(dear.base_reserve, dear.quote_reserve, base_out);
+    quote_out - amount_in
+}
+
 /// 求两池之间的最优投入规模。
 ///
 /// 利润关于投入额是单峰的：投太少吃不满价差，投太多把自己的价格推回去。
@@ -69,14 +85,7 @@ pub fn best_two_pool_arb(cheap: &ReserveQuote, dear: &ReserveQuote) -> Option<Tw
         return None;
     }
 
-    let profit_at = |amount_in: f64| -> f64 {
-        let base_out = buy_base_with_quote(cheap.quote_reserve, cheap.base_reserve, amount_in);
-        if base_out <= 0.0 {
-            return f64::NEG_INFINITY;
-        }
-        let quote_out = sell_base_for_quote(dear.base_reserve, dear.quote_reserve, base_out);
-        quote_out - amount_in
-    };
+    let profit_at = |amount_in: f64| -> f64 { profit_at_size(cheap, dear, amount_in) };
 
     // 上限：低价池的 quote 储备。真的把整个池子买空是不现实的，
     // 但这是模型允许的边界，报告里用 pool_impact 提示。
@@ -205,5 +214,32 @@ mod tests {
         let mut b = quote("B", 1_000.0, 1_100_000.0);
         b.quote_mint = "OTHER".to_string();
         assert!(best_two_pool_arb(&a, &b).is_none());
+    }
+
+    #[test]
+    fn profit_collapses_when_oversized() {
+        // 2% 价差、两个中等深度的池子：最优解附近赚钱，放大 100 倍必亏
+        let cheap = quote("CH", 1_000.0, 1_000_000.0);
+        let dear = quote("DE", 1_000.0, 1_020_000.0);
+        let arb = best_two_pool_arb(&cheap, &dear).expect("应当有套利空间");
+
+        let at_optimal = profit_at_size(&cheap, &dear, arb.amount_in);
+        assert!(at_optimal > 0.0);
+        assert!((at_optimal - arb.profit).abs() < 1e-6);
+
+        let oversized = profit_at_size(&cheap, &dear, arb.amount_in * 100.0);
+        assert!(
+            oversized < at_optimal,
+            "放大 100 倍后的利润必须低于最优解（实际 {oversized} vs {at_optimal}）"
+        );
+        assert!(oversized < 0.0, "放大 100 倍应当由盈转亏，实际 {oversized}");
+    }
+
+    #[test]
+    fn profit_at_size_is_negative_without_spread() {
+        let cheap = quote("CH", 1_000.0, 1_000_000.0);
+        let dear = quote("DE", 1_000.0, 1_002_000.0);
+        assert!(profit_at_size(&cheap, &dear, 10.0) < 0.0);
+        assert!(profit_at_size(&cheap, &dear, 0.0).is_infinite());
     }
 }

@@ -23,10 +23,54 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 | Spread report CLI (`--spread-report`) | Done | Yes (real-data run) |
 | `PoolState` + reserve mid price (`src/pool_state.rs`) | Done | **Yes — 67/69 pools resolved on mainnet** |
 | Reserves report CLI (`--reserves-report`) | Done | Yes (live vault balances + VWAP deviation) |
-| Size-aware arbitrage sizing (`src/arb.rs`) | Done | Yes (7 unit tests + live run: optimal 0.0093 units) |
+| Size-aware arbitrage sizing (`src/arb.rs`) | Done | Yes (9 unit tests + live run: optimal 0.0059 units) |
+| Size ladder (`--reserves-report`) | Done | Yes (live run: ×5 of optimal is already negative) |
+| Sample expansion (8k CPMM txs) | Done | Yes — 1771 swaps / 619 pools / 269k slots |
 | `cargo deny` license/advisory check | Done | Yes |
 
 ## What changed in this pass
+
+### 0. The sample went from 234 swaps to 1771 — and the conclusion got sharper, not better
+
+The first pass proved the pipeline on 234 swaps over ~650 slots. This pass backfilled
+~8,000 CPMM transactions (progressive 1000 / 2000 / 4000 / 8000 windows so that
+rate-limited transactions from an earlier round get retried by the next one):
+
+| | before | after |
+|---|---|---|
+| swaps | 234 | 1771 |
+| pools (`pool_id`) | 69 | 619 |
+| slots covered | 648 | 269,131 |
+| pairs with ≥2 pools (reserve report) | 1 | 3 |
+| pools with ≥2 swaps | 1 | 267 |
+
+Two operational notes, both cost real time:
+
+- The default `SOLANA_RPC_URL` in `.env` points at a devnet endpoint that returns
+  **401**; `getAccount` then reports `AccountNotFound`, which reads like "wrong
+  program id" but is really "wrong RPC". Always pass `--rpc-url` explicitly.
+- The public mainnet endpoint is not reachable through the sandbox HTTP proxy (or
+  directly); it needs the local Clash proxy on `127.0.0.1:7890`. A plain
+  `getTransaction` failure is a `warn` and does not abort the run, so a rerun
+  recovers what a rate-limited round skipped.
+
+The headline finding: **a bigger sample produced a bigger-looking spread and an
+even smaller executable trade.** With 6 USDC/SOL pools the gross spread is 11.87%
+(net 11.37% after both fees), but the optimal fill is 0.0059 units — and the
+ladder shows why:
+
+```
+×1    投入 0.005897   盈亏 3.2470e-4   +551 bps
+×5    投入 0.029484   盈亏 -3.7489e-3  -1272 bps
+×20   投入 0.117937   盈亏 -5.5459e-2  -4702 bps
+×100  投入 0.589684   盈亏 -4.8880e-1  -8289 bps
+```
+
+The two "cheap" pools are 0.155 and 0.383 units deep. The spread exists because
+those pools are nearly empty; an order five times the optimum reverses it. This is
+the general shape, not an outlier: all three comparable pairs are shallow-pool
+artefacts (`+551 bps`, `+38 bps`, `+27 bps` at their own optimum, all negative at
+×5).
 
 ### 1. The program ID was wrong — this is why real ingestion "was blocked"
 
@@ -211,24 +255,28 @@ column is the measurement of that.
 
 ## Known risks / next steps
 
-- **Sample size.** 234 swaps over ~200 slots proves the pipeline, not the market.
-- **Same-pair coverage.** 64 pairs, 69 pools: only one pair has more than two
-  pools, so the cross-pool comparison has exactly one data point.
+- **Sample size.** 1771 swaps over 269k slots is better, but it is still one
+  backfill window of a program that trades continuously; seasonality and pool
+  churn are not represented.
+- **Same-pair coverage.** 235 pairs across 242 resolved pools, but only 3 pairs
+  have more than one pool. Cross-pool comparison is therefore three data points,
+  not a distribution — do not read a rate out of it.
 - **VWAP is a lagging estimate.** Measured against live reserves it deviates by
   tens of percent on thin pools (see above). Treat `--spread-report` as a
   trade-history summary, not a quote; use `--reserves-report` for a price.
 - **Depth is a reserve balance, not executable size.** `src/arb.rs` now computes
-  the optimal trade for a pair with constant-product fill, but it assumes the
-  reserves stay put and that the only cost is the 25 bps fee. Gas, priority
-  fees, multi-hop routes and being front-run are all missing — the number it
-  prints is an upper bound, and on single-digit-unit pools it is a very small
-  one.
+  the optimal trade for a pair with constant-product fill, and the ladder shows
+  how fast it decays (×5 of the optimum is already negative on all three pairs).
+  It still assumes the reserves stay put and that the only cost is the 25 bps
+  fee. Gas, priority fees, multi-hop routes and being front-run are all missing —
+  the number it prints is an upper bound, and on single-digit-unit pools it is a
+  very small one.
 - **The heuristic fallback still writes rows.** A transaction with no CPMM swap
   instruction (or one whose instruction we fail to decode) falls back to
   "any two token deltas under one owner", and `pool_id` becomes that owner.
-  The reserves report surfaces these as `owner … 不是 CPMM 程序`; 2 of 69 in the
-  current sample. Better: drop the row and count it, instead of storing an
-  address that cannot be resolved.
+  The reserves report surfaces these as `owner … 不是 CPMM 程序`; 8 of 250 in the
+  current sample (Whirlpool pools swept in by the owner heuristic). Better: drop
+  the row and count it, instead of storing an address that cannot be resolved.
 - **Discriminators and account layout may drift** with program upgrades. They are
   now derived from `sha256("global:<name>")` and covered by tests, but a new
   instruction variant would need a new constant.
