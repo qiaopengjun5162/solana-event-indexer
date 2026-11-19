@@ -25,7 +25,8 @@ Build a minimal, Rust-only signal indexer for Solana Raydium CPMM swaps that can
 | Reserves report CLI (`--reserves-report`) | Done | Yes (live vault balances + VWAP deviation) |
 | Size-aware arbitrage sizing (`src/arb.rs`) | Done | Yes (9 unit tests + live run: optimal 0.0059 units) |
 | Size ladder (`--reserves-report`) | Done | Yes (live run: ×5 of optimal is already negative) |
-| Multi-hop cycles (`--cycles-report`) | Done | Yes — 928 cycles / 367 profitable / best 0.002 SOL |
+| Multi-hop cycles (`--cycles-report`) | Done | Yes — 928 cycles / 352 profitable / best 0.002067 SOL |
+| Second anchor (`--cycle-anchors`) | Done | Yes — USDC adds 8 cycles, 0 clear the fee floor |
 | Sample expansion (8k CPMM txs) | Done | Yes — 2090 swaps / 674 pools / 269k slots |
 | Undecodable swap policy (`src/parser.rs`) | Done | Yes — 213/213 new pools resolve as CPMM |
 | `cargo deny` license/advisory check | Done | Yes |
@@ -283,6 +284,41 @@ report exactly (`FmRjg2XV/So111` → +804 bps at 0.008502, same figure the
 reserves report prints for the same pair). The multi-hop engine is the two-pool
 engine with more legs, not a second implementation that might disagree.
 
+### 8b. A second anchor adds nothing, and the reason is the pool graph
+
+Anchoring on SOL is a real blind spot: a loop that never touches SOL
+(USDC → A → B → USDC) is invisible to it. `--cycle-anchors` takes a comma list
+(`SOL,USDC` by default; a full mint also works) and enumerates from each.
+
+Profits come back in the anchor's own units, so they are converted to SOL before
+being compared with the fee floor — using the **deepest** SOL pair for that mint,
+not an average. A mint with no SOL pair is skipped and counted rather than
+guessed. Cycles reachable from two anchors are deduped by **directed leg set**:
+a pool set would also collapse the reverse direction, which is a different trade
+(and usually the only losing one).
+
+Live run, same 660 pools, 50k-lamport priority fee:
+
+```
+3 跳闭环候选 936 条（起点 So111111 + EPjFWdd5，多锚点按有向腿去重）
+  起点 So111111：候选 928 条，盈利 352 条，扣固定成本后 175 条，最好 0.002067 SOL
+  起点 EPjFWdd5：候选   8 条，盈利   3 条，扣固定成本后   0 条，最好 0.000010 SOL
+```
+
+The SOL row reproduces the single-anchor run exactly, so multi-anchor is a strict
+superset, not a different engine. The USDC row is the finding: **eight candidate
+loops, three barely profitable, none within 5× of the fee floor.**
+
+It is not a bug in the enumeration — it is the shape of the market. Of the 660
+resolved pools, 295 trade against wrapped SOL (954 swaps) and 141 against USDC
+(408 swaps), and almost nothing trades USDC against anything but SOL. A
+USDC → A → B → USDC triangle needs A and B to each have a USDC pool *and* a
+shared pool; on this graph that combination barely exists. The pool graph is a
+star with SOL at the centre, so "loops that skip SOL" is close to an empty set.
+
+This closes the last route-coverage objection. Two pools, three pools, SOL-
+anchored, USDC-anchored: every variant returns the same answer.
+
 ## Verification commands run
 ```bash
 cargo fmt
@@ -295,6 +331,7 @@ cargo run --release -- --backfill 700 --rpc-url https://api.mainnet-beta.solana.
 cargo run --release -- --spread-report --window-slots 5000 --min-net-pct 0.05
 cargo run --release -- --reserves-report --pool-limit 700 --window-slots 400
 cargo run --release -- --cycles-report --pool-limit 700 --cycle-hops 3 --cycles-top 5
+cargo run --release -- --cycles-report --pool-limit 700 --cycle-anchors SOL,USDC
 ```
 
 Real-data result (2026-11-18, public mainnet RPC, after the pool-id fix):
@@ -347,10 +384,13 @@ column is the measurement of that.
   prints is an upper bound. The absolute sizes are what matters: the best 3-hop
   cycle in 928 pays 0.002 SOL, so the bound being loose does not rescue any of
   them.
-- **Cycle enumeration is exhaustive only for one anchor.** Cycles must start and
-  end at wrapped SOL. A profitable loop that never touches SOL (USDC → X → Y →
-  USDC) is invisible here; adding a second anchor is cheap but every extra mint
-  multiplies the search, so it should be driven by where volume actually is.
+- **Cycle enumeration is fixed-length per anchor (second anchor added).**
+  `--cycle-anchors` defaults to SOL + USDC and accepts full mints. Three anchors
+  would cover the rest of the graph, but the measured reason not to bother is in
+  8b: the graph is a star centred on SOL, and USDC — the second-most connected
+  mint — contributes eight loops. A fourth-hop search is the more interesting
+  axis than a third anchor, because it changes the loop length rather than the
+  starting point.
 - **Undecodable swaps are now dropped, not guessed (fixed this pass).** The old
   fallback wrote `pool_id = vault owner` for any owner with two offsetting token
   deltas; that address has no account data, so the reserves report could never

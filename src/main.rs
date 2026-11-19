@@ -68,14 +68,21 @@ struct Args {
     #[arg(long, default_value_t = 200)]
     pool_limit: i64,
 
-    /// Evaluate SOL-anchored multi-hop cycles (SOL → A → B → SOL) against live
-    /// reserves and exit. Answers what the two-pool report cannot see: whether
-    /// cross-token mispricing leaves SOL on the table after all three fees.
+    /// Evaluate multi-hop cycles (SOL → A → B → SOL, or USDC → A → B → USDC)
+    /// against live reserves and exit. Answers what the two-pool report cannot
+    /// see: whether cross-token mispricing leaves money on the table after all
+    /// three fees. Profits are converted to SOL before the fee floor is applied,
+    /// so anchors are comparable.
     #[arg(long)]
     cycles_report: bool,
     /// Legs per cycle. 3 = triangle; 2 degenerates to the two-pool case.
     #[arg(long, default_value_t = 3)]
     cycle_hops: usize,
+    /// Comma-separated cycle anchors. `SOL` alone only sees loops that touch
+    /// wrapped SOL; adding `USDC` also sees USDC → A → B → USDC loops. Accepts
+    /// SOL / USDC / a full mint address.
+    #[arg(long, default_value = "SOL,USDC")]
+    cycle_anchors: String,
     /// How many cycles to print, sorted by model profit.
     #[arg(long, default_value_t = 10)]
     cycles_top: usize,
@@ -423,41 +430,93 @@ async fn report_cycles(
         return Ok(());
     }
 
-    let cycles = arb::find_cycles(&snapshot.quotes, arb::WRAPPED_SOL, args.cycle_hops);
+    let anchors: Vec<String> = args
+        .cycle_anchors
+        .split(',')
+        .filter_map(|raw| {
+            let name = raw.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let resolved = arb::resolve_anchor(name);
+            if resolved.is_none() {
+                eprintln!("忽略无法识别的锚点 `{name}`（写 SOL / USDC 或完整 mint）");
+            }
+            resolved
+        })
+        .collect();
+    if anchors.is_empty() {
+        println!("没有可用锚点，闭环无从枚举。");
+        return Ok(());
+    }
+
+    // 利润以各锚点自己的币计价，要折回 SOL 才能和 lamports 手续费相减。
+    // 折不了的锚点（没有 SOL 配对池）直接跳过：宁可少报，不猜汇率。
+    let mut unit_in_sol: HashMap<String, f64> = HashMap::new();
+    for anchor in &anchors {
+        match arb::sol_price_of(&snapshot.quotes, anchor) {
+            Some(price) => {
+                unit_in_sol.insert(anchor.clone(), price);
+            }
+            None => println!(
+                "锚点 {} 找不到与 SOL 配对的池子，它的利润无法折成 SOL，本轮跳过",
+                short_key(anchor)
+            ),
+        }
+    }
+    let anchors: Vec<String> =
+        anchors.into_iter().filter(|a| unit_in_sol.contains_key(a)).collect();
+    if anchors.is_empty() {
+        println!("所有锚点都折不成 SOL，无法与固定成本比较。");
+        return Ok(());
+    }
+
+    let cycles = arb::find_cycles_from_anchors(&snapshot.quotes, &anchors, args.cycle_hops);
     let fee_sol = arb::fee_floor_sol(args.priority_fee_lamports);
+    let anchor_names = anchors.iter().map(|a| short_key(a)).collect::<Vec<_>>().join(" + ");
     println!(
-        "{} 跳闭环候选 {} 条（起点 wrapped SOL）；固定成本 {} lamports = {:.6} SOL",
+        "{} 跳闭环候选 {} 条（起点 {anchor_names}，多锚点按有向腿去重）；固定成本 {} lamports = {:.6} SOL",
         args.cycle_hops,
         cycles.len(),
         5_000 + args.priority_fee_lamports,
         fee_sol
     );
 
-    let mut scored: Vec<(arb::CycleArb, &arb::Cycle)> = cycles
+    // 第三条是折算成 SOL 的毛利，排序与"扣固定成本"都用它。
+    let mut dropped_unpriced = 0usize;
+    let mut scored: Vec<(arb::CycleArb, &arb::Cycle, f64)> = cycles
         .iter()
-        .filter_map(|cycle| arb::best_cycle_arb(cycle).map(|result| (result, cycle)))
+        .filter_map(|cycle| {
+            let result = arb::best_cycle_arb(cycle)?;
+            let Some(rate) = unit_in_sol.get(&cycle.start_mint) else {
+                dropped_unpriced += 1;
+                return None;
+            };
+            let profit_sol = result.profit * rate;
+            Some((result, cycle, profit_sol))
+        })
         .collect();
-    scored.sort_by(|a, b| b.0.profit.partial_cmp(&a.0.profit).unwrap_or(std::cmp::Ordering::Equal));
-    let clears_fee = scored.iter().filter(|(r, _)| r.profit > fee_sol).count();
+    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    let clears_fee = scored.iter().filter(|(_, _, profit_sol)| *profit_sol > fee_sol).count();
 
     // 同一串币种往往对应多个池子组合（SOL→X→USDC→SOL 可能有七八种走法）。
     // 不归并的话，榜首会被同一类机会刷屏，看不出到底有几种错价。
-    let mut by_path: HashMap<String, (arb::CycleArb, &arb::Cycle, usize)> = HashMap::new();
-    for (result, cycle) in &scored {
+    let mut by_path: HashMap<String, (arb::CycleArb, &arb::Cycle, f64, usize)> = HashMap::new();
+    for (result, cycle, profit_sol) in &scored {
         let key = cycle.mints().join(">");
         match by_path.get_mut(&key) {
-            Some(entry) if entry.0.profit >= result.profit => entry.2 += 1,
+            Some(entry) if entry.2 >= *profit_sol => entry.3 += 1,
             Some(entry) => {
-                let variants = entry.2 + 1;
-                *entry = (result.clone(), cycle, variants);
+                let variants = entry.3 + 1;
+                *entry = (result.clone(), cycle, *profit_sol, variants);
             }
             None => {
-                by_path.insert(key, (result.clone(), cycle, 1));
+                by_path.insert(key, (result.clone(), cycle, *profit_sol, 1));
             }
         }
     }
-    let mut paths: Vec<(arb::CycleArb, &arb::Cycle, usize)> = by_path.into_values().collect();
-    paths.sort_by(|a, b| b.0.profit.partial_cmp(&a.0.profit).unwrap_or(std::cmp::Ordering::Equal));
+    let mut paths: Vec<(arb::CycleArb, &arb::Cycle, f64, usize)> = by_path.into_values().collect();
+    paths.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     println!(
         "模型内盈利 {} 条，落在 {} 条不同币种路径上；扣掉固定成本后仍为正 {} 条",
@@ -465,11 +524,38 @@ async fn report_cycles(
         paths.len(),
         clears_fee
     );
+    // 分锚点看：第二锚点到底带来了什么，必须用数字回答，不能只看总榜。
+    for anchor in &anchors {
+        let candidates = cycles.iter().filter(|c| &c.start_mint == anchor).count();
+        let mut best_here = 0.0f64;
+        let mut profitable = 0usize;
+        let mut clears = 0usize;
+        for (_, cycle, profit_sol) in &scored {
+            if &cycle.start_mint != anchor {
+                continue;
+            }
+            profitable += 1;
+            if *profit_sol > fee_sol {
+                clears += 1;
+            }
+            if *profit_sol > best_here {
+                best_here = *profit_sol;
+            }
+        }
+        println!(
+            "  起点 {}：候选 {candidates} 条，盈利 {profitable} 条，扣固定成本后 {clears} 条，最好 {:.6} SOL",
+            short_key(anchor),
+            best_here
+        );
+    }
+    if dropped_unpriced > 0 {
+        println!("另有 {dropped_unpriced} 条闭环的锚点折不成 SOL，未计入统计");
+    }
     // 利润的绝对值比 bps 更能说明问题：+1136 bps 听着很多，投 0.0175 SOL 只赚 0.002 SOL。
-    let bucket = |floor: f64| scored.iter().filter(|(r, _)| r.profit >= floor).count();
-    let best = scored.first().map(|(r, _)| r.profit).unwrap_or(0.0);
+    let bucket = |floor: f64| scored.iter().filter(|(_, _, p)| *p >= floor).count();
+    let best = scored.first().map(|(_, _, p)| *p).unwrap_or(0.0);
     println!(
-        "利润分布（SOL，未扣 gas）：≥0.1 {} / 0.01–0.1 {} / 0.001–0.01 {} / <0.001 {}；最高 {:.6} SOL",
+        "利润分布（SOL 计价，未扣 gas）：≥0.1 {} / 0.01–0.1 {} / 0.001–0.01 {} / <0.001 {}；最高 {:.6} SOL",
         bucket(0.1),
         bucket(0.01) - bucket(0.1),
         bucket(0.001) - bucket(0.01),
@@ -478,27 +564,42 @@ async fn report_cycles(
     );
     if paths.is_empty() {
         println!();
-        println!("没有任何闭环能盖住每条腿 25 bps 的手续费——三块池子之间没有可利用的相对错价。");
+        println!("没有任何闭环能盖住每条腿 25 bps 的手续费——这些池子之间没有可利用的相对错价。");
         return Ok(());
     }
     println!();
 
-    for (i, (result, cycle, variants)) in paths.iter().take(args.cycles_top).enumerate() {
+    for (i, (result, cycle, profit_sol, variants)) in paths.iter().take(args.cycles_top).enumerate()
+    {
         let path = cycle.mints().iter().map(|m| short_key(m)).collect::<Vec<_>>().join(" → ");
         let pools_path = cycle.pools().iter().map(|p| short_key(p)).collect::<Vec<_>>().join(" / ");
+        let is_sol = cycle.start_mint == arb::WRAPPED_SOL;
         println!(
             "{:>2}) {path}（同路径 {variants} 种走法，这是最好的一条）",
             i + 1
         );
         println!("      池子：{pools_path}");
-        println!(
-            "      最优下单：投入 {} → 拿回 {}，毛利 {}（{:+.0} bps），扣固定成本后 {}",
-            fmt_price(result.amount_in),
-            fmt_price(result.amount_out),
-            fmt_price(result.profit),
-            result.profit_bps,
-            fmt_price(result.profit - fee_sol)
-        );
+        if is_sol {
+            println!(
+                "      最优下单：投入 {} → 拿回 {}，毛利 {}（{:+.0} bps），扣固定成本后 {}",
+                fmt_price(result.amount_in),
+                fmt_price(result.amount_out),
+                fmt_price(result.profit),
+                result.profit_bps,
+                fmt_price(result.profit - fee_sol)
+            );
+        } else {
+            let unit = short_key(&cycle.start_mint);
+            println!(
+                "      最优下单：投入 {} {unit} → 拿回 {} {unit}，毛利 {} {unit} ≈ {} SOL（{:+.0} bps），扣固定成本后 {} SOL",
+                fmt_price(result.amount_in),
+                fmt_price(result.amount_out),
+                fmt_price(result.profit),
+                fmt_price(*profit_sol),
+                result.profit_bps,
+                fmt_price(profit_sol - fee_sol)
+            );
+        }
         println!(
             "      最紧的一条腿吃掉 {:.2}% 的储备",
             result.worst_impact * 100.0
