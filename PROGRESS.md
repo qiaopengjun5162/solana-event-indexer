@@ -39,10 +39,10 @@ rate-limited transactions from an earlier round get retried by the next one):
 
 | | before | after |
 |---|---|---|
-| swaps | 234 | 1771 |
-| pools (`pool_id`) | 69 | 619 |
-| slots covered | 648 | 269,131 |
-| pairs with ≥2 pools (reserve report) | 1 | 3 |
+| swaps | 234 | 2037 |
+| pools (`pool_id`) | 69 | 660 |
+| slots covered | 648 | 307,830 |
+| pairs with ≥2 pools (reserve report, all pools) | 1 | 14 |
 | pools with ≥2 swaps | 1 | 267 |
 
 Two operational notes, both cost real time:
@@ -55,6 +55,22 @@ Two operational notes, both cost real time:
   `getTransaction` failure is a `warn` and does not abort the run, so a rerun
   recovers what a rate-limited round skipped.
 
+### 0b. Pruned 14 non-CPMM pools (53 rows)
+
+Every one of the 660 remaining `pool_id`s was re-checked on chain with
+`getMultipleAccounts`. 14 were not CPMM-owned — 6 Meteora DLMM, 4 Orca
+Whirlpool, 2 system-owned vault PDAs, 1 Raydium CLMM, 1 REAL — all produced by
+the removed heuristic fallback. Their 53 rows were copied to
+`swaps_noncpmm_backup_20261119` and deleted:
+
+```
+swaps 2090 → 2037   pools 674 → 660
+reserves report: 660/660 parsed, 0 unparsable (was 8/250)
+```
+
+Two of the previously reported "opportunities" (+38 bps and +27 bps) had a
+non-CPMM pool as one leg, so they were never real either.
+
 The headline finding: **a bigger sample produced a bigger-looking spread and an
 even smaller executable trade.** With 6 USDC/SOL pools the gross spread is 11.87%
 (net 11.37% after both fees), but the optimal fill is 0.0059 units — and the
@@ -66,6 +82,21 @@ ladder shows why:
 ×20   投入 0.117937   盈亏 -5.5459e-2  -4702 bps
 ×100  投入 0.589684   盈亏 -4.8880e-1  -8289 bps
 ```
+
+With all 660 pools loaded instead of the top 250, the reserve report finds 14
+comparable pairs. Ten reach the printed top-10; eight of them have a positive
+model profit at their own optimum, and **all eight turn negative at ×5**:
+
+| pair | pools | gross % | optimal in | bps | ×5 bps |
+|---|---|---|---|---|---|
+| EPjFWdd5/So111 | 7 | 11.943 | 0.005931 | +554 | -1277 |
+| FmRjg2XV/So111 | 2 | 17.306 | 0.008502 | +804 | -1674 |
+| 9BB6NFEc/So111 | 2 | 4.565 | 0.013590 | +200 | -542 |
+| 5TAcFVXU/So111 | 4 | 4.295 | 0.024230 | +187 | -510 |
+| 2G72iP4K/So111 | 4 | 1.894 | 0.004587 | +69 | -200 |
+| So111/USD1ttGY | 3 | 1.177 | 0.124659 | +34 | -99 |
+| 4cQ9BeG6/So111 | 2 | 1.165 | 0.011697 | +33 | -97 |
+| Grass7B4/So111 | 2 | 0.744 | 0.000343 | +12 | -36 |
 
 The two "cheap" pools are 0.155 and 0.383 units deep. The spread exists because
 those pools are nearly empty; an order five times the optimum reverses it. This is
