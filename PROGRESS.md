@@ -319,6 +319,38 @@ star with SOL at the centre, so "loops that skip SOL" is close to an empty set.
 This closes the last route-coverage objection. Two pools, three pools, SOL-
 anchored, USDC-anchored: every variant returns the same answer.
 
+### 8c. Four legs: more money, and an even thinner pool
+
+Changing the *length* of the loop rather than the anchor is the last axis worth
+testing. No code change was needed — `--cycle-hops 4` on the same 660 pools:
+
+```
+4 跳闭环候选 4506 条（起点 So111111 + EPjFWdd5）
+  起点 So111111：候选 4398 条，盈利 897 条，扣固定成本后 296 条，最好 0.009479 SOL
+  起点 EPjFWdd5：候选  108 条，盈利  18 条，扣固定成本后   1 条，最好 0.000309 SOL
+利润分布：≥0.1 0 / 0.01–0.1 0 / 0.001–0.01 18 / <0.001 897；最高 0.009479 SOL
+```
+
+The headline profit is 4.6× the 3-hop best (0.009479 vs 0.002067 SOL, about
+$1.9), which is the first number in this project that is not dust. It is also
+the clearest demonstration of the depth problem:
+
+```
+best 4-hop: SOL → FLYZuFHS → 7vfCXTUX → FUAfBo2j → SOL
+  optimal in 0.025272 SOL, profit 0.009479 (+3751 bps)
+  tightest leg consumes 30.54% of that pool's reserve
+  ×5 → -3424 bps    ×20 → -7776 bps
+```
+
+A loop that eats **30% of a pool** to make two dollars is not a trade — it is a
+quote that cannot survive contact with the market. Every positive cycle still
+turns negative at ×5. The longer route finds a bigger *number* by reaching for
+an even shallower pool, not by finding a deeper inefficiency.
+
+Across all four variants — 2 pools, 3 hops, 4 hops, SOL/USDC anchors — the
+answer is unchanged: **the constraint is depth. Route coverage only decides how
+thin a pool you have to reach for.**
+
 ## Verification commands run
 ```bash
 cargo fmt
